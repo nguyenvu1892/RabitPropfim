@@ -4,6 +4,22 @@
 
 ---
 
+### [TRAIN] SAC on SMC + Volume + PA Features ✅
+- **200K steps** trên 5 symbols, M5 primary TF (50K bars/symbol, 260 days)
+- Convergence: 41.8% WR @50K → **49.4% @90K** → **42.8% WR @130K (best reward 3.05)**
+- H1 inside bar exit rule: chốt hết lệnh khi H1 nến inside bar
+- Model mới: 2.63M params (1,795 obs dim = 64×28 features + 3 state)
+
+### [REFACTOR] Feature Pipeline → SMC + Volume + Price Action ✅
+- **Xóa:** RSI, ATR, MA distance, rolling vol (indicator truyền thống ❌)
+- **Thêm SMC:** swing_structure, BOS/CHoCH, order_blocks, fair_value_gaps, liquidity_zones
+- **Thêm PA:** pin_bar, engulfing, inside_bar
+- **Thêm Volume:** vol_delta, climax_vol (ngoài relative_volume hiện có)
+- **Giữ:** candle_ratios, relative_volume, time_encoding, log_return
+- **28 features** tổng (thay 14 cũ), đổi TF chính M1 → **M5**
+- Config: thêm `h1_inside_bar_exit: true` vào prop_rules.yaml
+- Tests: **161 passed, 2 skipped** ✅
+
 ### [TRAIN] SAC Agent — 200K Training Run ✅
 - `scripts/train_agent.py`: SAC (MLP 256x256, 1.16M params, twin critics, auto-α)
 - **200K steps** trên 5 symbols (XAUUSD, US100, US30, ETHUSD, BTCUSD)

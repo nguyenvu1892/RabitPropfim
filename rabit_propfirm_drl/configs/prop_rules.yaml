@@ -38,6 +38,9 @@ confidence_threshold: 0.3       # |confidence| must exceed this to trade
 max_loss_per_trade_pct: 0.003    # 0.3% max loss per single trade
 daily_loss_cooldown_pct: 0.03    # 3% daily loss → stop trading, resume next day
 
+# ─── SMC Exit Rules ───
+h1_inside_bar_exit: true          # H1 inside bar → chốt hết lệnh, chờ cơ hội tiếp
+
 # Risk Killswitch (Prop Firm hard limits)
 killswitch_dd_threshold: 0.045  # Force-close all at 4.5% DD (buffer before 5%)
 

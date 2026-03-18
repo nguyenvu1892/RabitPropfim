@@ -68,6 +68,9 @@ class PropRulesConfig(BaseModel):
     max_loss_per_trade_pct: float = Field(0.003, ge=0.001, le=0.05)
     daily_loss_cooldown_pct: float = Field(0.03, ge=0.005, le=0.10)
 
+    # SMC Exit Rules
+    h1_inside_bar_exit: bool = Field(True)
+
     # Per-symbol execution config
     symbol_configs: dict[str, SymbolConfig] = Field(default_factory=dict)
 
