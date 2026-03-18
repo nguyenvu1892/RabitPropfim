@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from live_execution.killswitch import EquityWatchdog, Killswitch
+from live_execution.killswitch import DailyLossGate, EquityWatchdog, Killswitch
 from model_registry.registry import ModelRegistry
 from training_pipeline.safe_retrain import SafeRetrainer
 
@@ -222,3 +222,68 @@ class TestSafeRetrainer:
                                new_checkpoint={"w": torch.tensor([2.0])})
         retrainer.try_retrain({"eval_reward": 6.0}, {"eval_reward": 5.5})
         assert len(retrainer.history) == 2
+
+
+# ─────────────────────────────────────────────
+# DailyLossGate Tests
+# ─────────────────────────────────────────────
+
+class TestDailyLossGate:
+
+    def _config(self) -> dict:
+        return {
+            "max_loss_per_trade_pct": 0.003,  # 0.3%
+            "daily_loss_cooldown_pct": 0.03,   # 3%
+        }
+
+    def test_max_sl_amount(self) -> None:
+        gate = DailyLossGate(self._config())
+        # 0.3% of $100,000 = $300
+        assert gate.max_sl_amount(100_000) == pytest.approx(300.0)
+
+    def test_can_trade_initially(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        assert gate.can_trade()
+
+    def test_cooldown_after_3pct_loss(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        # 10 losing trades of $300 each = $3000 = 3%
+        for _ in range(10):
+            gate.record_trade_result(pnl=-300.0, balance=100_000)
+        assert not gate.can_trade()
+        assert gate.is_cooled_down
+
+    def test_still_trading_below_threshold(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        # 5 losing trades = 1.5%
+        for _ in range(5):
+            gate.record_trade_result(pnl=-300.0, balance=100_000)
+        assert gate.can_trade()
+        assert gate.daily_loss_pct == pytest.approx(0.015)
+
+    def test_winning_trades_dont_count(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        gate.record_trade_result(pnl=500.0, balance=100_500)  # Win
+        assert gate.daily_loss_pct == 0.0  # Wins don't add to loss
+        assert gate.can_trade()
+
+    def test_remaining_daily_risk(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        gate.record_trade_result(pnl=-1000.0, balance=99_000)  # 1%
+        assert gate.remaining_daily_risk == pytest.approx(0.02)
+
+    def test_alert_on_cooldown(self) -> None:
+        gate = DailyLossGate(self._config())
+        gate.start_day(100_000)
+        alerts: list[str] = []
+        gate.set_alert_callback(lambda t, d: alerts.append(t))
+        for _ in range(10):
+            gate.record_trade_result(pnl=-300.0, balance=100_000)
+        assert len(alerts) == 1
+        assert "COOLDOWN" in alerts[0]
+

@@ -64,6 +64,10 @@ class PropRulesConfig(BaseModel):
     # Killswitch
     killswitch_dd_threshold: float = Field(..., gt=0, le=0.10)
 
+    # Strict per-trade / daily loss limits
+    max_loss_per_trade_pct: float = Field(0.003, ge=0.001, le=0.05)
+    daily_loss_cooldown_pct: float = Field(0.03, ge=0.005, le=0.10)
+
     # Per-symbol execution config
     symbol_configs: dict[str, SymbolConfig] = Field(default_factory=dict)
 

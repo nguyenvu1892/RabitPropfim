@@ -4,6 +4,13 @@
 
 ---
 
+### [FEAT] Per-Trade & Daily Loss Limits ✅
+- `prop_rules.yaml`: thêm `max_loss_per_trade_pct: 0.003` (0.3%) + `daily_loss_cooldown_pct: 0.03` (3%)
+- `killswitch.py`: thêm class `DailyLossGate` — max SL tính toán, cooldown auto-reset ngày mới
+- `validator.py`: thêm 2 trường mới vào `PropRulesConfig`
+- `test_safety.py`: thêm 7 test cases cho DailyLossGate — all PASSED ✅
+- **Nguyên tắc:** Thua 1 lệnh max 0.3%, thua cả ngày 3% → dừng đến ngày hôm sau
+
 ### [INFRA] Merge all Sprint branches → main + MT5 FTMO Connection ✅
 - Merged 7 branches vào `main` (fast-forward, no conflicts)
 - Tạo `.env` chứa FTMO Demo credentials (gitignored)
