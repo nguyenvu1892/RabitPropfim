@@ -4,6 +4,15 @@
 
 ---
 
+### [FEAT] T2.1-T2.3 — Gymnasium Environment & Reward Engine ✅
+- **Branch:** `sprint2/T2.1-T2.3-gym-environment`
+- Viết `environments/physics_sim.py`: variable spread (session/news/vol), log slippage, exec delay, partial fill, requote
+- Viết `environments/reward_engine.py`: 8-component reward (PnL, delta-unrealized, exp-DD penalty, overnight, spread cost, R/R bonus, overtrading, inaction) + episode termination
+- Viết `environments/prop_env.py`: custom Gymnasium env — continuous action [confidence, risk_frac, sl_mult, tp_mult], action gating (HOLD if conf < 0.3), position SL/TP tracking, DD termination
+- Viết `tests/test_environment.py`: 26 test cases — all PASSED ✅
+- **Total test suite:** 70/70 PASSED ✅
+- **Trạng thái:** Sprint 2 DONE
+
 ### [FEAT] T1.2-T1.5 — Data Engine & Utilities ✅
 - **Branch:** `sprint1/T1.2-T1.5-data-engine-utils`
 - Viết `data_engine/mt5_fetcher.py`: graceful import, incremental fetch, multi-symbol batch, Polars Parquet zstd compression
