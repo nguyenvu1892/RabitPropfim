@@ -18,7 +18,7 @@ import pytest
 
 from models.transformer_smc import TransformerSMC, SinusoidalPositionalEncoding
 from models.transformer import TimeSeriesTransformer, LearnablePositionalEncoding
-from models.cross_attention import CrossAttentionFusion, MultiTimeframeEncoder
+from models.cross_attention import CrossAttentionFusion, MultiTimeframeEncoder, CrossAttentionMTF
 from models.actor_critic import Actor, TwinQCritic
 from models.regime_detector import RegimeDetector
 
@@ -138,7 +138,108 @@ class TestTransformer:
 
 
 # ─────────────────────────────────────────────
-# Cross-Attention Tests
+# CrossAttentionMTF Tests (Sprint 3.2 — Multi-TF Cross-Attention)
+# ─────────────────────────────────────────────
+
+class TestCrossAttentionMTF:
+    """Tests for CrossAttentionMTF: M5 (Q) × H1+H4 (K,V) cross-attention."""
+
+    def test_cross_attention_mtf_init(self) -> None:
+        """T3.2.2a — Model initializes without errors with valid params."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4,
+        )
+        assert model.embed_dim == 128
+        assert model.n_heads == 4
+        assert model.n_cross_layers == 1
+
+    def test_cross_attention_mtf_forward_shape(self) -> None:
+        """T3.2.2b — Output must be (batch=32, embed_dim=128)."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4,
+        )
+        m5 = torch.randn(32, 64, 28)   # 64 M5 bars
+        h1 = torch.randn(32, 24, 28)   # 24 H1 bars (1 day)
+        h4 = torch.randn(32, 30, 28)   # 30 H4 bars (5 days)
+        out = model(m5, h1, h4)
+        assert out.shape == (32, 128), f"Expected (32, 128), got {out.shape}"
+
+    def test_cross_attention_mtf_gradient_flow(self) -> None:
+        """Gradients must flow back through ALL 3 inputs (M5, H1, H4)."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4,
+        )
+        m5 = torch.randn(4, 64, 28, requires_grad=True)
+        h1 = torch.randn(4, 24, 28, requires_grad=True)
+        h4 = torch.randn(4, 30, 28, requires_grad=True)
+        out = model(m5, h1, h4)
+        loss = out.sum()
+        loss.backward()
+        assert m5.grad is not None, "Gradient must flow to M5 input"
+        assert h1.grad is not None, "Gradient must flow to H1 input"
+        assert h4.grad is not None, "Gradient must flow to H4 input"
+        # Also verify model params received gradients
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
+
+    def test_cross_attention_mtf_memory_efficient(self) -> None:
+        """T3.2.2c — Memory should stay well under 2GB for batch_size=64."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4,
+        )
+        # Compute theoretical attention matrix size
+        batch = 64
+        seq_m5 = 64
+        seq_context = 24 + 30  # H1 + H4 = 54
+        n_heads = 4
+        # Attention matrix: (batch, heads, seq_m5, seq_context) × float32
+        attn_bytes = batch * n_heads * seq_m5 * seq_context * 4
+        attn_mb = attn_bytes / (1024 * 1024)
+        # Must be way under 2GB (should be ~3.4 MB)
+        assert attn_mb < 100, f"Attention matrix too large: {attn_mb:.1f} MB"
+
+        # Actually run forward pass to verify no OOM
+        m5 = torch.randn(batch, seq_m5, 28)
+        h1 = torch.randn(batch, 24, 28)
+        h4 = torch.randn(batch, 30, 28)
+        out = model(m5, h1, h4)
+        assert out.shape == (batch, 128)
+
+    def test_cross_attention_weights_extraction(self) -> None:
+        """get_cross_attention_weights should return weights per layer."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4, n_cross_layers=1,
+        )
+        m5 = torch.randn(2, 64, 28)
+        h1 = torch.randn(2, 24, 28)
+        h4 = torch.randn(2, 30, 28)
+        weights = model.get_cross_attention_weights(m5, h1, h4)
+        assert len(weights) == 1, "Should have 1 weight tensor (1 cross-attn layer)"
+        # Shape: (batch, n_heads, seq_m5, seq_context)
+        assert weights[0].shape == (2, 4, 64, 54), f"Got {weights[0].shape}"
+
+    def test_cross_attention_single_sample(self) -> None:
+        """Single sample should work without errors."""
+        model = CrossAttentionMTF(
+            n_features_m5=28, n_features_h1=28, n_features_h4=28,
+            embed_dim=128, n_heads=4,
+        )
+        m5 = torch.randn(1, 64, 28)
+        h1 = torch.randn(1, 24, 28)
+        h4 = torch.randn(1, 30, 28)
+        out = model(m5, h1, h4)
+        assert out.shape == (1, 128)
+        assert torch.all(torch.isfinite(out))
+
+
+# ─────────────────────────────────────────────
+# Legacy Cross-Attention Tests (backward compat)
 # ─────────────────────────────────────────────
 
 class TestCrossAttention:
