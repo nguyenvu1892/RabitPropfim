@@ -4,6 +4,33 @@
 
 ---
 
+### [SPRINT 3.2] CrossAttentionMTF ✅ — 18/03/2026 22:25
+- Rewrite `models/cross_attention.py`: M5 (Q) × H1+H4 (K,V) full-sequence cross-attention
+- `ContextEncoder` cho H1/H4 (1-layer lightweight Transformer)
+- Attn matrix = 64×54 = 3,456 entries (~3.4 MB cho batch=64, **well under 2GB**)
+- `get_cross_attention_weights()` cho interpretability
+- Legacy wrappers (CrossAttentionFusion, MultiTimeframeEncoder) giữ backward compat
+- Tests: **32 passed** in 3.07s ✅
+
+### [SPRINT 3.1] TransformerSMC ✅ — 18/03/2026 22:10
+- NEW `models/transformer_smc.py`: Sinusoidal PE + `nn.TransformerEncoder` (2 layers, 4 heads, GELU, pre-norm) + Mean Pooling
+- Input: (B, 64, 28) → Output: (B, 128) — latent SMC pattern representation
+- `get_attention_weights()` cho SHAP analysis
+- Zero hardcode — tất cả params qua `__init__`
+- Tests: **26 passed** (8 mới: init, shape, gradient, PE values, seq lengths, mask, attention weights)
+
+### [DOCS] MASTER_PLAN v4.0 — 18/03/2026 21:50
+- Cập nhật Sprint 1 tất cả ✅ DONE, Sprint 3 🔴 ĐANG LÀM
+- Thêm bảng TIẾN ĐỘ HIỆN TẠI, TRADING RULES
+- Đổi symbols, TF, features đúng với hệ thống SMC
+
+### [BACKTEST] Walk-Forward Holdout 20% — 18/03/2026 21:35
+- `scripts/backtest.py`: 3,002 trades trên 5 symbols (35 ngày holdout)
+- ETHUSD: **+56.7%**, WR 44.8%, PF 1.53, Sharpe 11.0 — pass V1 **~8 ngày**
+- BTCUSD: **+25.1%**, WR 42.8%, PF 1.32, Sharpe 7.0 — pass V1 **~16 ngày**
+- AVG: +18.7%, WR 44.8%, PF 1.22, DD 4.26%, Sharpe 4.6
+- Reports saved: `reports/backtest_report.json`, `reports/trade_log.json`
+
 ### [TRAIN] SAC on SMC + Volume + PA Features ✅
 - **200K steps** trên 5 symbols, M5 primary TF (50K bars/symbol, 260 days)
 - Convergence: 41.8% WR @50K → **49.4% @90K** → **42.8% WR @130K (best reward 3.05)**
