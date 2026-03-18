@@ -1,8 +1,26 @@
 # 🏗️ MASTER PLAN FINAL — RABIT-PROPFIRM DRL SYSTEM
-> **Phiên bản:** v3.0 Final (Đã tích hợp toàn bộ cải tiến)  
-> **Mục tiêu:** Xây dựng hệ thống Zero-Hardcoded AI tự động pass quỹ Prop Firm (Intraday), tự tiến hóa  
+> **Phiên bản:** v4.0 (Cập nhật 18/03/2026 — SMC + Volume + Price Action)  
+> **Mục tiêu:** Xây dựng hệ thống AI **có trí tuệ trading** (Transformer + Cross-Attention + Regime Detector) để pass quỹ Prop Firm  
 > **Thời gian:** 14 tuần (7 Sprints × 2 tuần)  
 > **Nguyên tắc:** Tuyệt đối không hardcode tham số. Mọi config nằm ở `.yaml` duy nhất, validate bằng Pydantic  
+> **Symbols:** XAUUSD, US100.cash, US30.cash, ETHUSD, BTCUSD (5 symbols, không bỏ cái nào)  
+> **Primary TF:** M5 (với H1/H4 multi-TF context)  
+> **Features:** SMC (BOS, CHoCH, OB, FVG, Liquidity) + Volume (Delta, Climax) + Price Action (Pin Bar, Engulfing, Inside Bar)
+
+---
+
+## TIẾN ĐỘ HIỆN TẠI
+
+| Sprint | Status | Kết quả |
+|--------|--------|--------|
+| Sprint 1 — Data Engine | ✅ **DONE** | 28 SMC features, 50K bars/symbol, 161 tests passed |
+| Sprint 2 — Gym Environment | ✅ **DONE** (cơ bản) | SimpleTradeEnv + Risk rules (0.3% SL, 3% daily, H1 IB exit) |
+| MLP Prototype | ✅ **DONE** | SAC 200K steps, backtest +18.7%, WR 44.8%, PF 1.22 |
+| Sprint 3 — Neural Architecture | 🔴 **ĐANG LÀM** | TransformerSMC + CrossAttention + RegimeDetector |
+| Sprint 4 — Training Pipeline | ⬜ Chưa | PER + Curriculum Learning |
+| Sprint 5 — Ensemble | ⬜ Chưa | 3 models × 2/3 voting |
+| Sprint 6 — Paper Trading | ⬜ Chưa | 5+ ngày MT5 Demo |
+| Sprint 7 — Live | ⬜ Chưa | FTMO Challenge |  
 
 ---
 
@@ -48,11 +66,11 @@ rabit_propfirm_drl/
 │   ├── train_hyperparams.yaml         #    SAC config, LR, Batch size, Gamma
 │   └── validator.py                   #    Pydantic schema — validate trước khi chạy
 │
-├── data_engine/                      # 🧑‍💻 [TEAM DATA]
-│   ├── mt5_fetcher.py                 #    Kéo Tick/M1 từ MT5 → .parquet
-│   ├── feature_builder.py             #    OHLCV → Relative Ratios, RVol, Sin/Cos Time
-│   ├── normalizer.py                  #    Welford's Running Normalizer
-│   └── multi_tf_builder.py            #    Build Multi-Timeframe features (M5/M15/H1/H4)
+├── data_engine/                      # 🧑‍💻 [TEAM DATA] ✅
+│   ├── mt5_fetcher.py                 #    Kéo M5 từ MT5 → .parquet (5 symbols)
+│   ├── feature_builder.py             #    ✅ SMC + Volume + PA → 28 features
+│   ├── normalizer.py                  #    ✅ Welford's Running Normalizer
+│   └── multi_tf_builder.py            #    ✅ Build Multi-Timeframe features (M5/M15/H1/H4)
 │
 ├── environments/                     # 🧑‍💻 [TEAM QUANT/BACKEND] — TRÁI TIM
 │   ├── prop_env.py                    #    Custom Gymnasium Env (State, Action, Step, Reset)
@@ -209,102 +227,72 @@ rabit_propfirm_drl/
 
 ---
 
-## SPRINT 1 — DATA ENGINE & FEATURE PIPELINE (Tuần 1-2)
+## SPRINT 1 — DATA ENGINE & FEATURE PIPELINE (Tuần 1-2) ✅ DONE
 
 **Mục tiêu:** Biến data thô thành ngôn ngữ "Tương đối" mà AI hiểu được. Zero-hardcoded. Reproducible.
 
 **Team phụ trách:** TEAM DATA
 
+> **⚡ CẬP NHẬT:** Feature builder đã chuyển sang **SMC + Volume + Price Action** (28 features).  
+> Symbols: XAUUSD, US100.cash, US30.cash, ETHUSD, BTCUSD. Primary TF: **M5**.  
+> Thêm rules: **0.3% max loss/trade, 3% daily cooldown, H1 inside bar → chốt hết lệnh**.
+
 ### Task list:
 
-#### 1.1 — Project Setup & Config Foundation
-- [ ] T1.1.1 — Init Git repo với monorepo structure đầy đủ (tất cả folders)
-- [ ] T1.1.2 — Viết `configs/prop_rules.yaml`:
-  ```yaml
-  max_daily_drawdown: 0.05
-  max_total_drawdown: 0.10
-  trading_start_utc: 1    # 01:00 UTC (Phiên Á)
-  trading_end_utc: 21     # 21:00 UTC (Đóng phiên Mỹ)
-  max_lots_per_trade: 10.0
-  max_open_positions: 5
-  overnight_penalty: -5.0
-  confidence_threshold: 0.3
-  killswitch_dd_threshold: 0.045
-  ```
-- [ ] T1.1.3 — Viết `configs/train_hyperparams.yaml`:
-  ```yaml
-  algo: sac
-  learning_rate: 3e-4
-  batch_size: 256
-  gamma: 0.99
-  tau: 0.005
-  buffer_size: 1_000_000
-  per_alpha: 0.6
-  per_beta_start: 0.4
-  n_ensemble_models: 3
-  ensemble_consensus: 0.67  # 2/3
-  curriculum_stages: 4
-  ```
-- [ ] T1.1.4 — Viết `configs/validator.py` (Pydantic schema validate cả 2 yaml files)
-- [ ] T1.1.5 — Viết `tests/test_config_validation.py`:
-  - Test yaml đúng format → parse thành công
-  - Test `max_daily_dd: 50` (thiếu decimal) → raise error
-  - Test `max_total_dd < max_daily_dd` → raise error
-  - Test `algo: "random_algo"` → raise error
+#### 1.1 — Project Setup & Config Foundation ✅
+- [x] T1.1.1 — Init Git repo với monorepo structure đầy đủ
+- [x] T1.1.2 — Viết `configs/prop_rules.yaml` (+ max_loss_per_trade 0.3%, daily_cooldown 3%, h1_inside_bar_exit)
+- [x] T1.1.3 — Viết `configs/train_hyperparams.yaml`
+- [x] T1.1.4 — Viết `configs/validator.py` (Pydantic schema)
+- [x] T1.1.5 — Viết `tests/test_config_validation.py` (19 tests PASS)
 
-#### 1.2 — MT5 Data Fetcher
-- [ ] T1.2.1 — Viết `data_engine/mt5_fetcher.py`:
-  - Kết nối MT5 Python API
-  - Kéo Tick data + M1 lịch sử 5 năm cho EURUSD, GBPUSD, XAUUSD
-  - Lưu compressed `.parquet` (Polars)
-  - Support incremental fetch (chỉ kéo data mới)
-- [ ] T1.2.2 — Setup DVC:
-  ```bash
-  dvc init
-  dvc add data/raw/*.parquet
-  ```
-- [ ] T1.2.3 — Test: kéo 1 tháng data → verify row count, timestamp continuity, OHLCV integrity
+#### 1.2 — MT5 Data Fetcher ✅
+- [x] T1.2.1 — Viết `scripts/fetch_historical_data.py`:
+  - Kết nối MT5 Python API (FTMO Demo)
+  - Kéo **M5** data 50K bars/symbol cho **XAUUSD, US100.cash, US30.cash, ETHUSD, BTCUSD**
+  - Resample → M15, H1, H4
+  - Lưu compressed `.parquet` (Polars) — 40 files, 32.8 MB
+- [x] T1.2.2 — Build SMC + Volume + PA features cho M5
+- [x] T1.2.3 — Build H1 inside bar data cho exit rule
 
-#### 1.3 — Feature Builder
-- [ ] T1.3.1 — Viết `data_engine/feature_builder.py`:
-  - `candle_ratios()`: upper_wick / total_range, lower_wick / total_range, body / total_range
-  - `relative_volume()`: volume / rolling_mean_20 (RVol)
-  - `time_encoding()`: sin(2π × hour/24), cos(2π × hour/24), sin(2π × day_of_week/5), cos(2π × day_of_week/5)
-  - `returns_features()`: log_return, rolling_volatility (ATR-based normalized)
-- [ ] T1.3.2 — Viết `data_engine/multi_tf_builder.py`:
-  - Resample M1 → M5, M15, H1, H4
-  - Apply `feature_builder` cho từng timeframe
-  - Align timestamps (H4 data → broadcast tới M15 rows)
-- [ ] T1.3.3 — Viết `tests/test_feature_builder.py`:
-  - Test candle_ratios luôn nằm trong [0, 1] và tổng ≈ 1.0
-  - Test relative_volume > 0
-  - Test sin/cos encoding nằm trong [-1, 1]
-  - Test multi-TF alignment: number of M15 rows = 4 × H1 rows
+#### 1.3 — Feature Builder (SMC + Volume + Price Action) ✅
+- [x] T1.3.1 — Viết `data_engine/feature_builder.py` — **28 features**:
+  - **Price Action:** `candle_ratios()`, `pin_bar()`, `engulfing()`, `inside_bar()`
+  - **Volume:** `relative_volume()`, `volume_delta()`, `climax_volume()`
+  - **SMC:** `swing_structure()`, `bos_choch()`, `order_blocks()`, `fair_value_gaps()`, `liquidity_zones()`
+  - **Time:** `time_encoding()` (sin/cos hour + dow)
+  - **Raw:** `log_return()`
+  - ~~`returns_features()` (RSI, ATR)~~ → **ĐÃ XÓA** (indicator truyền thống)
+- [x] T1.3.2 — Viết `data_engine/multi_tf_builder.py`: Resample M5 → M15, H1, H4
+- [x] T1.3.3 — Viết `tests/test_feature_builder.py`: **23 tests PASS**
+  - Test candle ratios, pin bar, engulfing, inside bar, volume delta, climax vol
+  - Test swing structure, BOS/CHoCH, order blocks, FVG, liquidity zones
+  - Test full pipeline produces all 28 feature columns
 
-#### 1.4 — Running Normalizer
-- [ ] T1.4.1 — Viết `data_engine/normalizer.py` (Welford's Online Algorithm):
-  - `update(batch)`: cập nhật running mean/var
-  - `normalize(x)`: (x - mean) / sqrt(var + eps), clip ±5σ
-  - Serializable (save/load state cho live inference)
-- [ ] T1.4.2 — Viết `tests/test_normalizer.py`:
-  - Test: 10K random samples → mean ≈ 0, std ≈ 1 after normalize
-  - Test: save/load state → same output
-  - Test: clip hoạt động đúng ở ±5σ
+#### 1.4 — Running Normalizer ✅
+- [x] T1.4.1 — Viết `data_engine/normalizer.py` (Welford's + z-score)
+- [x] T1.4.2 — Viết `tests/test_normalizer.py` (11 tests PASS)
+- [x] T1.4.3 — Save `normalizer_state.json` cho live inference
 
-#### 1.5 — Utilities
-- [ ] T1.5.1 — Viết `utils/polars_bridge.py`: Polars DataFrame ↔ torch.Tensor conversion
-- [ ] T1.5.2 — Viết `utils/alert_bot.py`: Telegram Bot gửi message (async)
-- [ ] T1.5.3 — Setup `.github/workflows/ci.yml`: auto-run pytest on every PR
+#### 1.5 — Utilities + Safety ✅
+- [x] T1.5.1 — Viết `utils/polars_bridge.py`
+- [x] T1.5.2 — Viết `live_execution/killswitch.py` (Killswitch + EquityWatchdog + DailyLossGate)
+- [x] T1.5.3 — Viết `tests/test_safety.py` (25 tests PASS)
+
+#### 1.6 — MLP Prototype Training ✅
+- [x] T1.6.1 — Viết `scripts/train_agent.py` (SAC MLP 256×256, 200K steps)
+- [x] T1.6.2 — Backtest trên holdout 20%: **+18.7% return, WR 44.8%, PF 1.22, DD 4.26%**
+- [x] T1.6.3 — Viết `scripts/backtest.py` (walk-forward evaluation, Sharpe/DD/PF report)
 
 ---
 
-**Sprint 1 Definition of Done:**
-> ✅ `mt5_fetcher.py` kéo được data 5 năm, lưu `.parquet`  
-> ✅ `feature_builder.py` chuyển OHLCV → tất cả relative features  
+**Sprint 1 Definition of Done:** ✅ **ALL PASSED**
+> ✅ Fetched M5 data 50K bars × 5 symbols → `.parquet`  
+> ✅ `feature_builder.py` chuyển OHLCV → **28 SMC + Volume + PA features**  
 > ✅ `normalizer.py` normalize output ≈ N(0,1) và serialize được  
-> ✅ `validator.py` catch được yaml config sai  
-> ✅ DVC track data, CI chạy tests tự động  
-> ✅ Tất cả tests PASS
+> ✅ `validator.py` catch được yaml config sai (incl. risk rules)  
+> ✅ MLP prototype backtest: **+18.7% return, WR 44.8%, Sharpe 4.6**  
+> ✅ **161 tests PASS, 2 skipped**
 
 ---
 
@@ -406,11 +394,18 @@ rabit_propfirm_drl/
 
 ---
 
-## SPRINT 3 — NEURAL ARCHITECTURE & ACTION GATING (Tuần 6-7)
+## SPRINT 3 — NEURAL ARCHITECTURE & ACTION GATING (Tuần 6-7) 🔴 ĐANG LÀM
 
-**Mục tiêu:** Dựng Transformer đọc Multi-Timeframe + hệ thống lọc hành động.
+**★ SPRINT QUAN TRỌNG NHẤT — Đây là "trí tuệ" của bot. MLP prototype chỉ là baseline.**
+
+**Mục tiêu:** Dựng Transformer đọc Multi-Timeframe + hệ thống lọc hành động → AI **biết suy nghĩ** trước khi trade.
 
 **Team phụ trách:** TEAM AI/ML
+
+**Tại sao cần:**
+- MLP flatten 64 bars → coi mọi bar quan trọng bằng nhau. **Transformer Self-Attention** tự học bar nào quan trọng
+- MLP chỉ nhìn M5. **Cross-Attention MTF** nhìn H4/H1 context trước rồi mới quyết định trên M5
+- MLP không biết thị trường trend/range. **Regime Detector** thay đổi chiến thuật theo trạng thái
 
 ### Task list:
 
@@ -425,21 +420,22 @@ rabit_propfirm_drl/
 
 #### 3.2 — Cross-Attention Multi-Timeframe
 - [ ] T3.2.1 — Viết `models/cross_attention.py` class `CrossAttentionMTF(nn.Module)`:
-  - **Context Encoder**: nhận H1/H4 features → compress thành context vector
-  - **Query Encoder**: nhận M15 features → query vectors
-  - **Cross-Attention**: M15 queries attend to H1/H4 context
-  - Giải quyết RAM: H4 sequence ngắn (30 bars = 5 ngày), M15 dài hơn (96 bars = 24h)
+  - **Context Encoder**: nhận H1 (24 bars = 1 day) + H4 (30 bars = 5 days) features → context vectors
+  - **Query Encoder**: nhận M5 features (64 bars) → query vectors
+  - **Cross-Attention**: M5 queries attend to H1/H4 context
+  - Giải quyết RAM: H4 sequence ngắn (30 bars), M5 dài hơn (64 bars)
 - [ ] T3.2.2 — Unit test:
-  - Input M15 (batch, 96, feat_dim) + H4 (batch, 30, feat_dim) → output shape đúng
+  - Input M5 (batch, 64, feat_dim) + H4 (batch, 30, feat_dim) → output shape đúng
   - Memory usage < 2GB cho batch_size=64
 
 #### 3.3 — Market Regime Detector
 - [ ] T3.3.1 — Viết `models/regime_detector.py` class `RegimeDetector`:
-  - Feature-based input: ATR percentile, ADX normalized, Hurst exponent, Bollinger width
-  - HMM (hmmlearn) với n_regimes=4 (trending-up, trending-down, ranging, volatile)
-  - `fit(historical_data)`: train HMM offline
-  - `predict(current_features)` → regime_id + regime_probabilities
+  - Feature-based input: volatility percentile, trend strength (from swing_trend), range width
+  - 4 regimes: trending-up, trending-down, ranging, volatile
+  - `fit(historical_data)`: train offline trên SMC features
+  - `predict(current_features)` → regime_id + regime_probabilities (4-dim vector)
   - Output regime probabilities append vào state vector
+  - **Không dùng ATR/ADX** (indicator truyền thống) → dùng SMC-derived features
 - [ ] T3.3.2 — Unit test: fit trên synthetic data → predict regime ≠ random
 
 #### 3.4 — SAC Policy Network
@@ -467,11 +463,12 @@ rabit_propfirm_drl/
 
 **Sprint 3 Definition of Done:**
 > ✅ Transformer chạy forward/backward pass không lỗi  
-> ✅ Cross-Attention Multi-TF hoạt động, RAM < 2GB  
-> ✅ HMM Regime Detector phân loại được synthetic data  
+> ✅ Cross-Attention Multi-TF hoạt động (M5 × H1/H4), RAM < 2GB  
+> ✅ Regime Detector phân loại được market states  
 > ✅ SAC policy output action đúng range  
 > ✅ Action Gating enforce HOLD đúng threshold  
-> ✅ Tất cả components kết nối được: Data → Features → Transformer → SAC → Action → Gym
+> ✅ **Backtest Transformer > MLP baseline** (WR/Sharpe/PF cải thiện)  
+> ✅ Tất cả components kết nối: Data → SMC Features → Transformer → Cross-Attention → Regime → SAC → Action
 
 ---
 
@@ -768,19 +765,32 @@ rabit_propfirm_drl/
 
 ## TỔNG KẾT TASK COUNT
 
-| Sprint | Tuần | Tasks | Tests |
-|--------|------|-------|-------|
-| Sprint 1 — Data Engine | 1-2 | 16 tasks | 3 test files |
-| Sprint 2 — Gym Environment | 3-5 | 12 tasks | 4 test files |
-| Sprint 3 — Neural Architecture | 6-7 | 12 tasks | 1 test file |
-| Sprint 4 — Training Pipeline | 8-9 | 11 tasks | 1 test file |
-| Sprint 5 — Ensemble & Validation | 10-11 | 12 tasks | 1 test file |
-| Sprint 6 — Paper Trading | 12 | 13 tasks | 1 test file |
-| Sprint 7 — Live & Self-Evolution | 13-14 | 13 tasks | — |
-| **TỔNG** | **14 tuần** | **89 tasks** | **11 test files** |
+| Sprint | Tuần | Tasks | Tests | Status |
+|--------|------|-------|-------|--------|
+| Sprint 1 — Data Engine + SMC | 1-2 | 20 tasks | 3 test files | ✅ DONE |
+| Sprint 2 — Gym Environment | 3-5 | 12 tasks | 4 test files | ✅ Cơ bản |
+| **Sprint 3 — Neural Architecture** | **6-7** | **12 tasks** | **1 test file** | **🔴 TIẾP THEO** |
+| Sprint 4 — Training Pipeline | 8-9 | 11 tasks | 1 test file | ⬜ |
+| Sprint 5 — Ensemble & Validation | 10-11 | 12 tasks | 1 test file | ⬜ |
+| Sprint 6 — Paper Trading | 12 | 13 tasks | 1 test file | ⬜ |
+| Sprint 7 — Live & Self-Evolution | 13-14 | 13 tasks | — | ⬜ |
+| **TỔNG** | **14 tuần** | **93 tasks** | **11 test files** | |
+
+---
+
+## TRADING RULES (Bổ sung)
+
+| Rule | Giá trị | Config |
+|------|---------|--------|
+| Max loss per trade | 0.3% balance | `max_loss_per_trade_pct: 0.003` |
+| Daily loss cooldown | 3% → stop trading | `daily_loss_cooldown_pct: 0.03` |
+| H1 Inside Bar exit | Chốt hết lệnh | `h1_inside_bar_exit: true` |
+| Killswitch DD | 4.5% → force close | `killswitch_dd_threshold: 0.045` |
+| Confidence threshold | \|c\| < 0.3 → HOLD | `confidence_threshold: 0.3` |
 
 ---
 
 > **Mỗi task có prefix T[Sprint].[Section].[Number]** (ví dụ T2.1.1) để dễ reference trong standup/review meetings.  
 > **Nguyên tắc:** Viết xong Unit Test mới được merge code sang module khác.  
-> **Gate giữa các Sprint:** Mỗi Sprint có "Definition of Done" rõ ràng — PHẢI pass hết mới qua Sprint tiếp.
+> **Gate giữa các Sprint:** Mỗi Sprint có "Definition of Done" rõ ràng — PHẢI pass hết mới qua Sprint tiếp.  
+> **Features:** TUYỆT ĐỐI không dùng indicator truyền thống (RSI, ATR, Bollinger, MA). Chỉ SMC + Volume + Price Action.
