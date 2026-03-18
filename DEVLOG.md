@@ -4,6 +4,15 @@
 
 ---
 
+### [SPRINT 3.3] RegimeDetector ✅ — 18/03/2026 22:35
+- Rewrite `models/regime_detector.py`: dual-mode (statistical GMM + neural MLP)
+- `SMCFeatureExtractor`: 5 features from SMC data (trend_strength, vol_pctl, range_ratio, bos_freq, vol_climax)
+- **ZERO traditional indicators** (no ATR/ADX/RSI/MA)
+- `GaussianMixtureRegime`: custom EM algorithm, K-means++ init, auto-labels regimes from centroids
+- 4 regimes: trend_up, trend_down, ranging, volatile
+- Logic test PASSED: synthetic uptrend data → GMM correctly predicts trend_up with highest probability
+- Tests: **38 passed** in 3.18s ✅
+
 ### [SPRINT 3.2] CrossAttentionMTF ✅ — 18/03/2026 22:25
 - Rewrite `models/cross_attention.py`: M5 (Q) × H1+H4 (K,V) full-sequence cross-attention
 - `ContextEncoder` cho H1/H4 (1-layer lightweight Transformer)

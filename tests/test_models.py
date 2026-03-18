@@ -20,7 +20,11 @@ from models.transformer_smc import TransformerSMC, SinusoidalPositionalEncoding
 from models.transformer import TimeSeriesTransformer, LearnablePositionalEncoding
 from models.cross_attention import CrossAttentionFusion, MultiTimeframeEncoder, CrossAttentionMTF
 from models.actor_critic import Actor, TwinQCritic
-from models.regime_detector import RegimeDetector
+from models.regime_detector import (
+    RegimeDetector, GaussianMixtureRegime, SMCFeatureExtractor,
+)
+
+import numpy as np
 
 
 # ─────────────────────────────────────────────
@@ -347,12 +351,24 @@ class TestCritic:
 
 
 # ─────────────────────────────────────────────
-# Regime Detector Tests
+# RegimeDetector Tests (Sprint 3.3 — SMC-based Regime Detection)
 # ─────────────────────────────────────────────
 
 class TestRegimeDetector:
+    """Tests for the neural RegimeDetector + statistical GMM."""
+
+    # ── Neural RegimeDetector (nn.Module) ──
+
+    def test_regime_detector_init(self) -> None:
+        """T3.3.2a — Model initializes without errors."""
+        detector = RegimeDetector(input_dim=64, n_regimes=4)
+        assert detector.n_regimes == 4
+        assert detector.input_dim == 64
+        assert len(detector.regime_names) == 4
+        assert "trend_up" in detector.regime_names
 
     def test_output_shapes(self) -> None:
+        """Output shapes: probs (B, 4), embedding (B, input_dim)."""
         detector = RegimeDetector(input_dim=64, n_regimes=4)
         x = torch.randn(8, 64)
         probs, emb = detector(x)
@@ -360,6 +376,7 @@ class TestRegimeDetector:
         assert emb.shape == (8, 64)
 
     def test_probabilities_sum_to_one(self) -> None:
+        """Regime probabilities must sum to 1 for each sample."""
         detector = RegimeDetector(input_dim=64, n_regimes=4)
         x = torch.randn(16, 64)
         probs, _ = detector(x)
@@ -367,6 +384,7 @@ class TestRegimeDetector:
         assert torch.allclose(sums, torch.ones(16), atol=1e-5)
 
     def test_predict_regime_returns_indices(self) -> None:
+        """Hard prediction returns valid regime indices [0-3]."""
         detector = RegimeDetector(input_dim=64, n_regimes=4)
         x = torch.randn(8, 64)
         regime_idx = detector.predict_regime(x)
@@ -378,3 +396,125 @@ class TestRegimeDetector:
         detector = RegimeDetector(input_dim=64, n_regimes=4)
         assert len(detector.regime_names) == 4
         assert "trend_up" in detector.regime_names
+        assert "trend_down" in detector.regime_names
+        assert "ranging" in detector.regime_names
+        assert "volatile" in detector.regime_names
+
+    def test_regime_gradient_flow(self) -> None:
+        """Gradients must flow through classifier and embeddings."""
+        detector = RegimeDetector(input_dim=64, n_regimes=4)
+        x = torch.randn(4, 64, requires_grad=True)
+        probs, emb = detector(x)
+        loss = probs.sum() + emb.sum()
+        loss.backward()
+        assert x.grad is not None
+        for name, p in detector.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"No gradient for {name}"
+
+    # ── Statistical GMM ──
+
+    def test_gmm_fit_predict_shape(self) -> None:
+        """T3.3.2b — GMM fit() then predict() produces (N, 4) with probs sum=1."""
+        np.random.seed(42)
+        gmm = GaussianMixtureRegime(n_regimes=4, max_iter=50)
+        # Generate random 5-dim features (100 samples)
+        X = np.random.randn(100, 5).astype(np.float32)
+        gmm.fit(X)
+        assert gmm.fitted is True
+
+        # Predict on new data
+        X_test = np.random.randn(20, 5).astype(np.float32)
+        probs = gmm.predict(X_test)
+        assert probs.shape == (20, 4), f"Expected (20, 4), got {probs.shape}"
+
+        # Each row must sum to 1
+        sums = probs.sum(axis=1)
+        np.testing.assert_allclose(sums, np.ones(20), atol=1e-4)
+
+    def test_gmm_all_probs_positive(self) -> None:
+        """All regime probabilities must be >= 0."""
+        np.random.seed(123)
+        gmm = GaussianMixtureRegime(n_regimes=4)
+        X = np.random.randn(200, 5).astype(np.float32)
+        gmm.fit(X)
+        probs = gmm.predict(X)
+        assert np.all(probs >= 0), "Probabilities must be non-negative"
+
+    def test_regime_detector_logic(self) -> None:
+        """T3.3.2c — Synthetic trending-up data should get highest trend_up prob."""
+        np.random.seed(42)
+        gmm = GaussianMixtureRegime(n_regimes=4, max_iter=100)
+
+        # Create 4 clear synthetic clusters:
+        n_per_cluster = 50
+
+        # Cluster 1: Trending UP — high trend, moderate vol, moderate range
+        trend_up = np.column_stack([
+            np.random.normal(0.8, 0.1, n_per_cluster),   # trend_strength ≈ 0.8
+            np.random.normal(0.4, 0.1, n_per_cluster),   # vol_pctl ≈ 0.4
+            np.random.normal(0.02, 0.005, n_per_cluster), # range_ratio
+            np.random.normal(0.3, 0.05, n_per_cluster),  # bos_freq
+            np.random.normal(0.1, 0.02, n_per_cluster),  # vol_climax
+        ]).astype(np.float32)
+
+        # Cluster 2: Trending DOWN — strong negative trend
+        trend_down = np.column_stack([
+            np.random.normal(-0.8, 0.1, n_per_cluster),
+            np.random.normal(0.4, 0.1, n_per_cluster),
+            np.random.normal(0.02, 0.005, n_per_cluster),
+            np.random.normal(0.3, 0.05, n_per_cluster),
+            np.random.normal(0.1, 0.02, n_per_cluster),
+        ]).astype(np.float32)
+
+        # Cluster 3: Ranging — no trend, low vol, small range
+        ranging = np.column_stack([
+            np.random.normal(0.0, 0.05, n_per_cluster),
+            np.random.normal(0.2, 0.05, n_per_cluster),
+            np.random.normal(0.005, 0.002, n_per_cluster),
+            np.random.normal(0.05, 0.02, n_per_cluster),
+            np.random.normal(0.02, 0.01, n_per_cluster),
+        ]).astype(np.float32)
+
+        # Cluster 4: Volatile — mixed trend, HIGH vol, wide range
+        volatile = np.column_stack([
+            np.random.normal(0.0, 0.3, n_per_cluster),
+            np.random.normal(0.9, 0.05, n_per_cluster),
+            np.random.normal(0.05, 0.01, n_per_cluster),
+            np.random.normal(0.15, 0.05, n_per_cluster),
+            np.random.normal(0.4, 0.1, n_per_cluster),
+        ]).astype(np.float32)
+
+        # Fit on all data
+        X_train = np.vstack([trend_up, trend_down, ranging, volatile])
+        gmm.fit(X_train)
+
+        # Test: a clearly trending-up sample should predict regime 0 (trend_up)
+        test_sample = np.array([[0.9, 0.4, 0.02, 0.3, 0.1]], dtype=np.float32)
+        probs = gmm.predict(test_sample)
+        assert probs.shape == (1, 4)
+        predicted_regime = np.argmax(probs[0])
+        # Regime 0 = trend_up (after auto-labeling)
+        assert predicted_regime == 0, (
+            f"Expected trend_up (0), got {predicted_regime}. "
+            f"Probs: {probs[0]} (order: trend_up, trend_down, ranging, volatile)"
+        )
+
+    def test_smc_feature_extractor(self) -> None:
+        """SMCFeatureExtractor should produce correct shape and valid values."""
+        np.random.seed(42)
+        n = 200
+        features = SMCFeatureExtractor.extract(
+            swing_trend=np.random.choice([-1, 0, 1], size=n).astype(np.float32),
+            log_return=np.random.randn(n).astype(np.float32) * 0.001,
+            high=100 + np.random.randn(n).astype(np.float32),
+            low=99 + np.random.randn(n).astype(np.float32),
+            close=99.5 + np.random.randn(n).astype(np.float32),
+            bos=np.random.choice([0, 1], size=n, p=[0.9, 0.1]).astype(np.float32),
+            climax_vol=np.random.choice([0, 1], size=n, p=[0.85, 0.15]).astype(np.float32),
+            window=20,
+        )
+        # Should produce (n//window - 1, 5) windows
+        assert features.shape[1] == 5, f"Expected 5 features, got {features.shape[1]}"
+        assert features.shape[0] > 0, "Should produce at least 1 window"
+        assert len(SMCFeatureExtractor.REGIME_FEATURE_NAMES) == 5
