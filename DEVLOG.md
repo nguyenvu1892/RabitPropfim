@@ -4,6 +4,21 @@
 
 ---
 
+### [FEAT] T1.2-T1.5 — Data Engine & Utilities ✅
+- **Branch:** `sprint1/T1.2-T1.5-data-engine-utils`
+- Viết `data_engine/mt5_fetcher.py`: graceful import, incremental fetch, multi-symbol batch, Polars Parquet zstd compression
+- Viết `data_engine/feature_builder.py`: candle ratios, RVol, sin/cos time encoding, log returns, ATR-normalized volatility, price position
+- Viết `data_engine/multi_tf_builder.py`: resample M1 → M5/M15/H1/H4, asof join alignment (chống look-ahead bias)
+- Viết `data_engine/normalizer.py`: Welford's online algorithm, Chan's batch merge, ±5σ clipping, JSON serialize/load
+- Viết `utils/polars_bridge.py`: Polars ↔ PyTorch conversion + sliding window sequence builder
+- Viết `utils/alert_bot.py`: Telegram Bot async/sync, convenience methods cho mọi event
+- Viết `tests/test_feature_builder.py`: 14 test cases covering all feature functions
+- Viết `tests/test_normalizer.py`: 11 test cases covering normalization, clipping, serialization, edge cases
+- **Fix:** Polars `map_batches` API → dùng numpy conversion trực tiếp cho time_encoding
+- **Fix:** Synthetic OHLCV generator — ensure high >= max(open,close), low <= min(open,close)
+- **Tests:** 44/44 PASSED ✅ (config: 19 + features: 14 + normalizer: 11)
+- **Trạng thái:** Sprint 1 DONE. Sẵn sàng merge → main
+
 ### [FEAT] T1.1 — Project Setup & Config Foundation ✅
 - **Branch:** `sprint1/T1.1-project-setup-config`
 - Tạo monorepo structure: 9 packages (`configs`, `data_engine`, `environments`, `models`, `agents`, `training_pipeline`, `live_execution`, `model_registry`, `utils`)
