@@ -4,6 +4,14 @@
 
 ---
 
+### [SPRINT 4.1+4.2] PER Buffer + CurriculumRunner -- 19/03/2026 06:15
+- `training_pipeline/per_buffer.py`: SumTree O(log n) + Multi-TF PER (M5+H1+H4)
+  - IS weights with beta annealing (0.4 -> 1.0), stratified sampling, GPU-ready
+- `training_pipeline/curriculum_runner.py`: 4-stage auto-promote
+  - Kindergarten (no cost) -> Elementary (variable spread) -> High School (real costs) -> University (news/gap)
+  - Auto-promote: rolling 1000-episode window, configurable thresholds
+- `tests/test_sprint4.py`: **30/30 PASSED** (SumTree=9, PER=9, Curriculum=12)
+
 ### [SPRINT 3.7] Backtest Transformer vs MLP -- 19/03/2026 01:55
 - `backtest_transformer.py`: holdout 20% trên 5 symbols
 - Transformer: WR 47.9%, PF 1.10, Sharpe 0.59, MaxDD 2.72%
