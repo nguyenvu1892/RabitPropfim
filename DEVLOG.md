@@ -4,6 +4,15 @@
 
 ---
 
+### [FEAT] T4.1-T4.3 — Training Pipeline ✅
+- **Branch:** `sprint4/T4.1-T4.3-training-pipeline`
+- Viết `training_pipeline/per_buffer.py`: SumTree O(log n), proportional PER, IS weights, beta annealing
+- Viết `training_pipeline/curriculum.py`: 4-stage progressive difficulty, auto-promote khi reward đạt threshold
+- Viết `training_pipeline/sac_trainer.py`: SAC update loop (twin Q-critic target, auto-α entropy, gradient clip, checkpoint)
+- Viết `tests/test_training.py`: 21 test cases — all PASSED ✅
+- **Total test suite:** 109/109 PASSED ✅
+- **Trạng thái:** Sprint 4 DONE
+
 ### [FEAT] T3.1-T3.3 — Neural Network Models ✅
 - **Branch:** `sprint3/T3.1-T3.3-neural-network-models`
 - Viết `models/transformer.py`: Pre-norm Transformer Encoder, CLS token, learnable positional encoding
