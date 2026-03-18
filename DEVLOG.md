@@ -4,6 +4,19 @@
 
 ---
 
+### [TRAIN] SAC Agent — First Training Run ✅
+- `scripts/train_agent.py`: end-to-end SAC training (MLP 256x256, twin critics, auto-α)
+- Trained 30K steps trên 5 symbols (rotate per episode)
+- Kết quả: Agent bắt đầu trade ở step 25K, reward 0.06, WR 20% (still early)
+- Saved `models_saved/best_model.pt` + `normalizer_state.json`
+
+### [DATA] Fetch Historical Data + Build Features ✅
+- `scripts/fetch_historical_data.py`: fetch M1 từ MT5 (copy_rates_from_pos, 50K-batch)
+- 5 symbols × 100K M1 bars = 500K total (~105 ngày/symbol)
+- Resample M15 (6,700+ bars), H1 (1,687 bars), H4 (442 bars)
+- Build 16 features: log_return, ATR, RSI, vol_ratio, body_ratio, RVol, time encoding
+- 25 Parquet files, 10.4 MB
+
 ### [FEAT] Per-Trade & Daily Loss Limits ✅
 - `prop_rules.yaml`: thêm `max_loss_per_trade_pct: 0.003` (0.3%) + `daily_loss_cooldown_pct: 0.03` (3%)
 - `killswitch.py`: thêm class `DailyLossGate` — max SL tính toán, cooldown auto-reset ngày mới
