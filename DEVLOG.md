@@ -4,6 +4,15 @@
 
 ---
 
+### [FEAT] T5.1-T5.3 — Safety Layer & Self-Evolution ✅
+- **Branch:** `sprint5/T5.1-T5.3-safety-layer`
+- Viết `live_execution/killswitch.py`: Triple-layer protection (soft/hard/emergency), alert callback, daily reset, EquityWatchdog
+- Viết `model_registry/registry.py`: Versioned checkpoints, best model tracking, rollback, JSON manifest
+- Viết `training_pipeline/safe_retrain.py`: Validation gate (5% improvement threshold), shadow training, eval pipeline
+- Viết `tests/test_safety.py`: 18 test cases — all PASSED ✅
+- **Total test suite:** 127/127 PASSED ✅
+- **Trạng thái:** Sprint 5 DONE
+
 ### [FEAT] T4.1-T4.3 — Training Pipeline ✅
 - **Branch:** `sprint4/T4.1-T4.3-training-pipeline`
 - Viết `training_pipeline/per_buffer.py`: SumTree O(log n), proportional PER, IS weights, beta annealing
