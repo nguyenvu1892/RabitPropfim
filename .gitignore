@@ -1,6 +1,10 @@
 # Skills (external subrepo)
 .agent/skills/
 
+# Secrets
+.env
+*.env
+
 # Python
 __pycache__/
 *.py[cod]

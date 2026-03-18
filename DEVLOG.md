@@ -4,6 +4,14 @@
 
 ---
 
+### [INFRA] Merge all Sprint branches → main + MT5 FTMO Connection ✅
+- Merged 7 branches vào `main` (fast-forward, no conflicts)
+- Tạo `.env` chứa FTMO Demo credentials (gitignored)
+- Tạo `.env.example` template (safe to commit)
+- Viết `scripts/test_mt5_connection.py`: full MT5 diagnostic
+- **Test kết quả:** Login OK, Balance $100,000, EURUSD available, Leverage 1:100
+- Tick = 0.0 do thị trường đóng cửa cuối tuần
+
 ### [FEAT] T6.1-T6.3 — Live Execution Engine ✅
 - **Branch:** `sprint6/T6.1-T6.3-live-execution`
 - Viết `live_execution/mt5_connector.py`: Market orders, position mgmt (close/modify/close-all), account queries, auto-reconnect
