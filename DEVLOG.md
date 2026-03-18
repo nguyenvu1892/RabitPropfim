@@ -4,6 +4,16 @@
 
 ---
 
+### [FEAT] T3.1-T3.3 — Neural Network Models ✅
+- **Branch:** `sprint3/T3.1-T3.3-neural-network-models`
+- Viết `models/transformer.py`: Pre-norm Transformer Encoder, CLS token, learnable positional encoding
+- Viết `models/cross_attention.py`: Cross-Attention fusion + MultiTimeframeEncoder (M15 → H1/H4)
+- Viết `models/actor_critic.py`: SAC Actor (squashed Gaussian + tanh + log prob correction) + Twin Q-Critic (clipped double-Q)
+- Viết `models/regime_detector.py`: Neural regime classifier (4 regimes) + learnable regime embeddings
+- Viết `tests/test_models.py`: 18 test cases — all PASSED ✅
+- **Total test suite:** 88/88 PASSED ✅
+- **Trạng thái:** Sprint 3 DONE
+
 ### [FEAT] T2.1-T2.3 — Gymnasium Environment & Reward Engine ✅
 - **Branch:** `sprint2/T2.1-T2.3-gym-environment`
 - Viết `environments/physics_sim.py`: variable spread (session/news/vol), log slippage, exec delay, partial fill, requote
