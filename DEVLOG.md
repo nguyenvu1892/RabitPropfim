@@ -4,6 +4,18 @@
 
 ---
 
+### [SPRINT 3.4+3.5] SAC Policy + ActionGating ✅ — 18/03/2026 22:45
+- NEW `agents/sac_policy.py`: Transformer backbone thay MLP
+  - `TransformerFeatureExtractor`: TransformerSMC + CrossAttentionMTF + RegimeDetector → **388-dim global_state**
+  - `SACTransformerActor`: Squashed Gaussian policy (mean + log_std → tanh)
+  - `SACTransformerCritic`: Twin Q-networks (Q1, Q2, min_q)
+- NEW `agents/action_gating.py`: confidence threshold gating
+  - |c| < 0.3 → HOLD (mandatory), c > 0.3 → BUY, c < -0.3 → SELL
+  - Risk scaled by: (|c| - threshold) / (1 - threshold)
+  - SL/TP multipliers mapped [-1,1] → [0.5, 2.0]
+- NEW `tests/test_action_gating.py`: **14 tests** (HOLD/BUY/SELL/edges/batch/risk scaling)
+- Tests: **52 passed** in 3.13s ✅
+
 ### [SPRINT 3.3] RegimeDetector ✅ — 18/03/2026 22:35
 - Rewrite `models/regime_detector.py`: dual-mode (statistical GMM + neural MLP)
 - `SMCFeatureExtractor`: 5 features from SMC data (trend_strength, vol_pctl, range_ratio, bos_freq, vol_climax)
