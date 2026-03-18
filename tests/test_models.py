@@ -2,6 +2,7 @@
 Tests for Sprint 3 — Neural Network Models.
 
 Validates:
+- TransformerSMC: Sinusoidal PE + Self-Attention + Mean Pooling (Sprint 3.1)
 - Transformer forward pass shape correctness
 - Cross-Attention fusion produces correct output dims
 - Actor outputs valid actions and log probs
@@ -15,6 +16,7 @@ from __future__ import annotations
 import torch
 import pytest
 
+from models.transformer_smc import TransformerSMC, SinusoidalPositionalEncoding
 from models.transformer import TimeSeriesTransformer, LearnablePositionalEncoding
 from models.cross_attention import CrossAttentionFusion, MultiTimeframeEncoder
 from models.actor_critic import Actor, TwinQCritic
@@ -22,7 +24,87 @@ from models.regime_detector import RegimeDetector
 
 
 # ─────────────────────────────────────────────
-# Transformer Tests
+# TransformerSMC Tests (Sprint 3.1 — SMC Self-Attention)
+# ─────────────────────────────────────────────
+
+class TestTransformerSMC:
+    """Tests for the new TransformerSMC module with sinusoidal PE + mean pooling."""
+
+    def test_transformer_smc_init(self) -> None:
+        """T3.1.2a — Model initializes without errors with valid params."""
+        model = TransformerSMC(
+            input_dim=28, embed_dim=128, n_heads=4, n_layers=2, dropout=0.1
+        )
+        assert model.input_dim == 28
+        assert model.embed_dim == 128
+        assert model.n_heads == 4
+        assert model.n_layers == 2
+
+    def test_transformer_smc_forward_shape(self) -> None:
+        """T3.1.2b — Output shape must be (batch=32, embed_dim=128)."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4, n_layers=2)
+        x = torch.randn(32, 64, 28)  # batch=32, seq_len=64, features=28
+        out = model(x)
+        assert out.shape == (32, 128), f"Expected (32, 128), got {out.shape}"
+
+    def test_transformer_smc_gradient_flow(self) -> None:
+        """T3.1.2c — Gradients must flow from output back through all parameters."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4, n_layers=2)
+        x = torch.randn(4, 64, 28, requires_grad=True)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+        # Verify gradients flow to input
+        assert x.grad is not None, "Gradient should flow back to input"
+        # Verify gradients flow to model parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
+
+    def test_sinusoidal_pe_values(self) -> None:
+        """Sinusoidal PE should produce values in [-1, 1] range."""
+        pe = SinusoidalPositionalEncoding(max_seq_len=128, embed_dim=128)
+        x = torch.zeros(1, 64, 128)
+        out = pe(x)
+        assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
+
+    def test_different_seq_lengths(self) -> None:
+        """Model should handle various sequence lengths (< max_seq_len)."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4, max_seq_len=256)
+        for seq_len in [10, 32, 64, 128]:
+            x = torch.randn(2, seq_len, 28)
+            out = model(x)
+            assert out.shape == (2, 128), f"Failed for seq_len={seq_len}"
+
+    def test_padding_mask(self) -> None:
+        """Model should support padding mask for variable-length sequences."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4)
+        x = torch.randn(4, 64, 28)
+        mask = torch.zeros(4, 64, dtype=torch.bool)
+        mask[:, 50:] = True  # Last 14 positions are padding
+        out = model(x, src_key_padding_mask=mask)
+        assert out.shape == (4, 128)
+        assert torch.all(torch.isfinite(out)), "Output should be finite with mask"
+
+    def test_single_sample(self) -> None:
+        """Single sample forward pass should work."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4)
+        x = torch.randn(1, 64, 28)
+        out = model(x)
+        assert out.shape == (1, 128)
+
+    def test_attention_weights_extraction(self) -> None:
+        """get_attention_weights should return one tensor per layer."""
+        model = TransformerSMC(input_dim=28, embed_dim=128, n_heads=4, n_layers=2)
+        x = torch.randn(2, 64, 28)
+        weights = model.get_attention_weights(x)
+        assert len(weights) == 2, "Should have one attention weight per layer"
+        for w in weights:
+            assert w.shape == (2, 4, 64, 64), f"Expected (2, 4, 64, 64), got {w.shape}"
+
+
+# ─────────────────────────────────────────────
+# Original Transformer Tests (baseline)
 # ─────────────────────────────────────────────
 
 class TestTransformer:
