@@ -4,6 +4,14 @@
 
 ---
 
+### [SPRINT 4.3] W&B Integration + Training Script v2 -- 19/03/2026 06:25
+- `scripts/train_v2.py`: PER + Curriculum + W&B monitoring
+  - W&B logs: reward, realized_pnl, max_drawdown, win_rate, stage, actor/critic loss, PER beta
+  - Checkpoint auto-upload: on promotion + best reward -> W&B Artifacts
+  - IS-weighted critic loss (PER), curriculum env overrides (spread/slippage/commission)
+  - --test flag: 1000-step dry run (offline W&B)
+- Test run OK: All metrics logged, stage=Kindergarten, beta=0.4
+
 ### [SPRINT 4.1+4.2] PER Buffer + CurriculumRunner -- 19/03/2026 06:15
 - `training_pipeline/per_buffer.py`: SumTree O(log n) + Multi-TF PER (M5+H1+H4)
   - IS weights with beta annealing (0.4 -> 1.0), stratified sampling, GPU-ready
