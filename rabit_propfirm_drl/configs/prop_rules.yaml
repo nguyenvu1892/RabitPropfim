@@ -1,0 +1,38 @@
+max_daily_drawdown: 0.05        # 5% daily drawdown limit
+max_total_drawdown: 0.10        # 10% total drawdown limit
+trading_start_utc: 1            # 01:00 UTC (Asian session open)
+trading_end_utc: 21             # 21:00 UTC (US session close)
+max_lots_per_trade: 10.0        # Maximum lot size per single trade
+max_open_positions: 5           # Maximum concurrent open positions
+max_trades_per_day: 15          # Overtrading threshold
+
+# Reward Engine Weights
+overnight_penalty: -5.0         # Penalty for holding past session end
+unrealized_shaping_weight: 0.1  # Weight for unrealized PnL shaping
+rr_bonus_threshold: 1.5         # Minimum RR ratio for bonus
+rr_bonus_coefficient: 0.3       # Bonus multiplier for good RR
+overtrading_penalty: -0.5       # Per-trade penalty when exceeding max
+inaction_nudge: -0.01           # Light penalty for excessive inaction
+inaction_threshold_steps: 500   # Steps before inaction penalty kicks in
+
+# Drawdown Penalty (Exponential)
+dd_penalty_alpha: 2.0           # Penalty base coefficient
+dd_penalty_beta: 3.0            # Exponential growth rate
+dd_penalty_start: 0.02          # Start penalizing from 2% DD
+
+# Action Gating
+confidence_threshold: 0.3       # |confidence| must exceed this to trade
+
+# Risk Killswitch
+killswitch_dd_threshold: 0.045  # Force-close all at 4.5% DD (buffer before 5%)
+
+# Spread & Execution Simulation
+base_spread_pips: 1.5           # Base spread for EURUSD
+news_spread_multiplier: 8.0     # Spread multiplier during news
+low_liquidity_multiplier: 2.5   # Spread multiplier during Asian session
+slippage_base_pips: 0.2         # Base slippage
+slippage_lot_coefficient: 0.1   # Additional slippage per log(lot)
+execution_delay_min_ms: 50      # Minimum execution delay
+execution_delay_max_ms: 150     # Maximum execution delay
+partial_fill_probability: 0.05  # 5% chance of partial fill
+requote_probability: 0.02       # 2% chance of requote
