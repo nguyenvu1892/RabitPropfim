@@ -36,8 +36,8 @@ FEATURE_COLS = [
     "dow_sin", "dow_cos",
 ]
 LOOKBACK = 64        # Bars of history the model sees
-TRAIN_STEPS = 30_000  # Total training steps (kept moderate for first run)
-EVAL_EVERY = 5_000   # Evaluate every N steps
+TRAIN_STEPS = 200_000 # Extended training for convergence
+EVAL_EVERY = 10_000  # Evaluate every N steps
 BATCH_SIZE = 128
 LR = 3e-4
 GAMMA = 0.99

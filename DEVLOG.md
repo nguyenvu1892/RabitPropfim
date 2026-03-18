@@ -4,11 +4,12 @@
 
 ---
 
-### [TRAIN] SAC Agent — First Training Run ✅
-- `scripts/train_agent.py`: end-to-end SAC training (MLP 256x256, twin critics, auto-α)
-- Trained 30K steps trên 5 symbols (rotate per episode)
-- Kết quả: Agent bắt đầu trade ở step 25K, reward 0.06, WR 20% (still early)
-- Saved `models_saved/best_model.pt` + `normalizer_state.json`
+### [TRAIN] SAC Agent — 200K Training Run ✅
+- `scripts/train_agent.py`: SAC (MLP 256x256, 1.16M params, twin critics, auto-α)
+- **200K steps** trên 5 symbols (XAUUSD, US100, US30, ETHUSD, BTCUSD)
+- Convergence curve: 0% WR (10K) → 31% (110K) → **49.4% (150K, best)** → 45.1% (200K)
+- Best eval reward: **5.46** tại step 150K
+- Saved `models_saved/best_model.pt` (best) + `final_model.pt` (200K)
 
 ### [DATA] Fetch Historical Data + Build Features ✅
 - `scripts/fetch_historical_data.py`: fetch M1 từ MT5 (copy_rates_from_pos, 50K-batch)
