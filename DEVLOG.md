@@ -4,6 +4,20 @@
 
 ---
 
+### [SPRINT 3.7] Backtest Transformer vs MLP -- 19/03/2026 01:55
+- `backtest_transformer.py`: holdout 20% trên 5 symbols
+- Transformer: WR 47.9%, PF 1.10, Sharpe 0.59, MaxDD 2.72%
+- MLP baseline: WR 44.8%, PF 1.22, Sharpe 4.61, MaxDD 4.26%
+- Transformer thắng WR (+3.1%) và MaxDD (-1.54%), MLP thắng PF và Sharpe
+- Transformer trade bảo thủ hơn: 822 trades vs 3,002 trades (MLP)
+
+### [SPRINT 3.6] Retrain Transformer 200K steps trên CUDA -- 19/03/2026 01:44
+- `train_transformer.py`: Multi-TF env (M5+H1+H4) + SACTransformerActor/Critic
+- GPU fix: device=CUDA (GTX 1660 SUPER), RuntimeError guard nếu CPU
+- Best checkpoint: step 140K, reward 4.34, WR 61.1%
+- Total params: 3,504,408 (Actor 1.06M + Critic 2x1.22M)
+- Training time: ~2.5h on GTX 1660 SUPER @ 20-22 sps
+
 ### [SPRINT 3.4+3.5] SAC Policy + ActionGating ✅ — 18/03/2026 22:45
 - NEW `agents/sac_policy.py`: Transformer backbone thay MLP
   - `TransformerFeatureExtractor`: TransformerSMC + CrossAttentionMTF + RegimeDetector → **388-dim global_state**
