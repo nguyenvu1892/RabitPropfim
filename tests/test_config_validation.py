@@ -56,7 +56,6 @@ def _valid_prop_rules() -> dict:
         "dd_penalty_start": 0.02,
         "confidence_threshold": 0.3,
         "killswitch_dd_threshold": 0.045,
-        "base_spread_pips": 1.5,
         "news_spread_multiplier": 8.0,
         "low_liquidity_multiplier": 2.5,
         "slippage_base_pips": 0.2,
@@ -243,9 +242,9 @@ class TestInvalidPropRules:
         with pytest.raises(Exception):
             load_prop_rules(fpath)
 
-    def test_negative_spread(self, tmp_path: Path) -> None:
+    def test_negative_slippage(self, tmp_path: Path) -> None:
         data = _valid_prop_rules()
-        data["base_spread_pips"] = -1.0
+        data["slippage_base_pips"] = -1.0
         fpath = _write_yaml(data, tmp_path)
         with pytest.raises(Exception):
             load_prop_rules(fpath)

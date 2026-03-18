@@ -1,5 +1,16 @@
+# ─── Target Symbols ───
+target_symbols:
+  - XAUUSD          # Gold
+  - US100.cash      # Nasdaq 100
+  - US30.cash       # Dow Jones 30
+  - ETHUSD          # Ethereum
+  - BTCUSD          # Bitcoin
+
+# ─── Prop Firm Rules ───
 max_daily_drawdown: 0.05        # 5% daily drawdown limit
 max_total_drawdown: 0.10        # 10% total drawdown limit
+profit_target: 0.10             # 10% profit target
+min_trading_days: 4             # Minimum trading days
 trading_start_utc: 1            # 01:00 UTC (Asian session open)
 trading_end_utc: 21             # 21:00 UTC (US session close)
 max_lots_per_trade: 10.0        # Maximum lot size per single trade
@@ -26,10 +37,28 @@ confidence_threshold: 0.3       # |confidence| must exceed this to trade
 # Risk Killswitch
 killswitch_dd_threshold: 0.045  # Force-close all at 4.5% DD (buffer before 5%)
 
-# Spread & Execution Simulation
-base_spread_pips: 1.5           # Base spread for EURUSD
+# Spread & Execution Simulation (per-symbol defaults)
+symbol_configs:
+  XAUUSD:
+    base_spread_pips: 20.0       # Gold spread ~20 points
+    pip_value: 0.01
+    fixed_lot: 0.01              # Conservative XAUUSD lot
+  US100.cash:
+    base_spread_pips: 1.5        # Nasdaq spread ~1.5 points
+    pip_value: 0.01
+  US30.cash:
+    base_spread_pips: 2.0        # Dow spread ~2.0 points
+    pip_value: 0.01
+  ETHUSD:
+    base_spread_pips: 2.0        # ETH spread ~2.0 points
+    pip_value: 0.01
+  BTCUSD:
+    base_spread_pips: 25.0       # BTC spread ~25 points
+    pip_value: 0.01
+
+# General Execution params
 news_spread_multiplier: 8.0     # Spread multiplier during news
-low_liquidity_multiplier: 2.5   # Spread multiplier during Asian session
+low_liquidity_multiplier: 2.5   # Spread multiplier during low liquidity
 slippage_base_pips: 0.2         # Base slippage
 slippage_lot_coefficient: 0.1   # Additional slippage per log(lot)
 execution_delay_min_ms: 50      # Minimum execution delay

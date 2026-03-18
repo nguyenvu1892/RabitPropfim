@@ -16,12 +16,24 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # Prop Firm Rules Schema
 # ─────────────────────────────────────────────
 
+class SymbolConfig(BaseModel):
+    """Per-symbol execution config."""
+    base_spread_pips: float = Field(..., gt=0)
+    pip_value: float = Field(0.01, gt=0)
+    fixed_lot: Optional[float] = None
+
+
 class PropRulesConfig(BaseModel):
     """Schema for prop_rules.yaml — validates all trading rules and reward params."""
+
+    # Target symbols
+    target_symbols: list[str] = Field(default_factory=list)
 
     # Drawdown limits
     max_daily_drawdown: float = Field(..., gt=0, le=0.10, description="Max daily DD as decimal")
     max_total_drawdown: float = Field(..., gt=0, le=0.15, description="Max total DD as decimal")
+    profit_target: float = Field(0.10, ge=0, le=1.0)
+    min_trading_days: int = Field(4, ge=1, le=30)
 
     # Trading hours
     trading_start_utc: int = Field(..., ge=0, le=23)
@@ -52,8 +64,10 @@ class PropRulesConfig(BaseModel):
     # Killswitch
     killswitch_dd_threshold: float = Field(..., gt=0, le=0.10)
 
-    # Execution simulation
-    base_spread_pips: float = Field(..., gt=0)
+    # Per-symbol execution config
+    symbol_configs: dict[str, SymbolConfig] = Field(default_factory=dict)
+
+    # Execution simulation (global defaults)
     news_spread_multiplier: float = Field(..., ge=1.0)
     low_liquidity_multiplier: float = Field(..., ge=1.0)
     slippage_base_pips: float = Field(..., ge=0)
