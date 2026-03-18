@@ -1,0 +1,110 @@
+{
+  "timestamp": "2026-03-18T21:33:19.145659",
+  "model": "C:\\Users\\Admin\\Desktop\\RabitPropfim\\models_saved\\best_model.pt",
+  "holdout_pct": "20%",
+  "results": {
+    "BTCUSD": {
+      "trades": 682,
+      "win_rate": 42.81524926686217,
+      "total_return": 25.114412837460588,
+      "total_pnl": 25114.41283746058,
+      "avg_win": 355.7749257164374,
+      "avg_loss": 205.1350663326539,
+      "rr_ratio": 1.7343447518597372,
+      "profit_factor": 1.3188246550600076,
+      "max_dd": 3.547707326079767,
+      "sharpe": 7.0151364135362435,
+      "sortino": 20.65781963874147,
+      "days_to_10pct": 16.205422572921478,
+      "exit_reasons": {
+        "SL_HIT": 180,
+        "LOW_CONFIDENCE": 333,
+        "TP_HIT": 51,
+        "H1_INSIDE_BAR": 112,
+        "DAILY_COOLDOWN": 6
+      }
+    },
+    "ETHUSD": {
+      "trades": 724,
+      "win_rate": 44.751381215469614,
+      "total_return": 56.741162880529416,
+      "total_pnl": 56741.16288052942,
+      "avg_win": 506.50819175116584,
+      "avg_loss": 276.0089749276308,
+      "rr_ratio": 1.8351149337950756,
+      "profit_factor": 1.5284761916442253,
+      "max_dd": 3.9691049151232893,
+      "sharpe": 10.980533806726026,
+      "sortino": 27.15829370170263,
+      "days_to_10pct": 8.122144956492228,
+      "exit_reasons": {
+        "LOW_CONFIDENCE": 294,
+        "H1_INSIDE_BAR": 107,
+        "SL_HIT": 240,
+        "TP_HIT": 73,
+        "DAILY_COOLDOWN": 10
+      }
+    },
+    "US100_cash": {
+      "trades": 514,
+      "win_rate": 46.30350194552529,
+      "total_return": 4.910812934137354,
+      "total_pnl": 4910.812934137357,
+      "avg_win": 163.82386431621563,
+      "avg_loss": 123.92460644771641,
+      "rr_ratio": 1.3219639667391856,
+      "profit_factor": 1.1440997239415498,
+      "max_dd": 2.8506355997107025,
+      "sharpe": 2.8786518300414325,
+      "sortino": 4.739758145176225,
+      "days_to_10pct": 75.04261766820382,
+      "exit_reasons": {
+        "LOW_CONFIDENCE": 341,
+        "H1_INSIDE_BAR": 91,
+        "SL_HIT": 74,
+        "TP_HIT": 8
+      }
+    },
+    "US30_cash": {
+      "trades": 488,
+      "win_rate": 47.74590163934426,
+      "total_return": 0.2055452345882003,
+      "total_pnl": 205.54523458819313,
+      "avg_win": 115.50659654934555,
+      "avg_loss": 105.56320854312021,
+      "rr_ratio": 1.0941936887240755,
+      "profit_factor": 1.0076961639237532,
+      "max_dd": 4.195051486505672,
+      "sharpe": 0.17397995262108676,
+      "sortino": 0.27410378715016875,
+      "days_to_10pct": 1279.5689213039684,
+      "exit_reasons": {
+        "LOW_CONFIDENCE": 332,
+        "H1_INSIDE_BAR": 98,
+        "SL_HIT": 56,
+        "TP_HIT": 2
+      }
+    },
+    "XAUUSD": {
+      "trades": 594,
+      "win_rate": 42.592592592592595,
+      "total_return": 6.554179640266877,
+      "total_pnl": 6554.179640266884,
+      "avg_win": 265.46872387860276,
+      "avg_loss": 179.84987389026594,
+      "rr_ratio": 1.4760573256813987,
+      "profit_factor": 1.1081379922771326,
+      "max_dd": 6.735287336769264,
+      "sharpe": 2.0248084803964757,
+      "sortino": 6.284028796031593,
+      "days_to_10pct": 55.759286652528345,
+      "exit_reasons": {
+        "LOW_CONFIDENCE": 318,
+        "H1_INSIDE_BAR": 100,
+        "SL_HIT": 142,
+        "TP_HIT": 31,
+        "DAILY_COOLDOWN": 3
+      }
+    }
+  }
+}
