@@ -4,6 +4,15 @@
 
 ---
 
+### [FEAT] T6.1-T6.3 — Live Execution Engine ✅
+- **Branch:** `sprint6/T6.1-T6.3-live-execution`
+- Viết `live_execution/mt5_connector.py`: Market orders, position mgmt (close/modify/close-all), account queries, auto-reconnect
+- Viết `live_execution/inference_pipeline.py`: Feature→Model→Decision pipeline, killswitch integration, trading hours check
+- Viết `live_execution/paper_trading.py`: Session tracking, Prop Firm pass/fail validation (DD, profit target, min days), JSON report
+- Viết `tests/test_live_execution.py`: 20 test cases — all PASSED ✅
+- **Total test suite:** 147/147 PASSED ✅
+- **Trạng thái:** Sprint 6 DONE
+
 ### [FEAT] T5.1-T5.3 — Safety Layer & Self-Evolution ✅
 - **Branch:** `sprint5/T5.1-T5.3-safety-layer`
 - Viết `live_execution/killswitch.py`: Triple-layer protection (soft/hard/emergency), alert callback, daily reset, EquityWatchdog
