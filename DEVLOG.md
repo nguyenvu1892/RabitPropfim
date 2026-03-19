@@ -4,6 +4,18 @@
 
 ---
 
+### [SPRINT 4.5] Safe Nightly Retrain -- 19/03/2026 20:15
+- `training_pipeline/safe_retrain.py`: MixedSampler (20/80) + SafeNightlyRetrainer
+  - Fine-tune: lr=1e-5, grad_clip=0.5, max 5 epochs
+  - Validation Gate: new_sharpe >= old*0.9 AND new_dd <= old*1.1
+  - Model backup before overwrite, rollback support
+- `tests/test_nightly_retrain.py`: **16/16 PASSED**
+- **SPRINT 4 COMPLETE!**
+
+### [SPRINT 4.4] Cloud GPU Setup (RunPod L40) -- 19/03/2026 16:55
+- `requirements.txt` + `scripts/setup_runpod.sh`: 1-click deploy
+- `RabitPropfim_RunPod.zip`: 41MB archive (code + data + best_v2.pt)
+
 ### [SPRINT 4.3] W&B Integration + Training Script v2 -- 19/03/2026 06:25
 - `scripts/train_v2.py`: PER + Curriculum + W&B monitoring
   - W&B logs: reward, realized_pnl, max_drawdown, win_rate, stage, actor/critic loss, PER beta
