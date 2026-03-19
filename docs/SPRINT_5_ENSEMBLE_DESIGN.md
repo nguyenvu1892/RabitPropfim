@@ -1,6 +1,6 @@
 # Sprint 5: Ensemble & Validation -- Architecture Design
 
-**Author:** An (AI Engineer) | **Date:** 19/03/2026 | **Status:** Proposal
+**Author:** An (AI Engineer) | **Date:** 19/03/2026 | **Status:** Approved
 
 ---
 
@@ -183,22 +183,21 @@ class EnsembleAgent:
             actions.append(action)
             confidences.append(confidence)
 
-        # 4. Weighted voting
+        # 4. Weighted score voting (no majority counting)
+        scores = [c * w for c, w in zip(confidences, weights)]
         weighted_direction = sum(
             a[0] * c * w
             for a, c, w in zip(actions, confidences, weights)
         )
 
-        # 5. Average risk/SL/TP from agreeing agents
-        agreeing = [a for a in actions if np.sign(a[0]) == np.sign(weighted_direction)]
-        if len(agreeing) >= 2:  # Majority agrees
-            avg_action = np.mean(agreeing, axis=0)
-            avg_action[0] = weighted_direction
-        else:
-            avg_action = np.array([0, 0, 0, 0])  # HOLD -- no consensus
+        # 5. SL/TP/Risk from TOP-SCORING agent (not average)
+        top_idx = int(np.argmax(scores))
+        final_action = actions[top_idx].copy()
+        final_action[0] = weighted_direction  # Direction from ensemble
+        # action[1]=risk, action[2]=SL, action[3]=TP all from top agent
 
         # 6. Apply ActionGating (final safety)
-        final_action = self.gating(avg_action)
+        final_action = self.gating(final_action)
         return final_action
 
     def _compute_weights(self, regime_id, conf):
@@ -228,14 +227,13 @@ flowchart TD
     C -->|Ranging| E[Boost RangeAgent weight]
     C -->|Volatile| F[Boost VolAgent weight]
     D & E & F --> G[All 3 Agents Predict]
-    G --> H[Weighted Confidence Vote]
-    H --> I{Majority Agrees?}
-    I -->|Yes >= 2/3| J[Average Action]
-    I -->|No| K[HOLD - No Trade]
+    G --> H[Weighted Score Vote]
+    H --> I[Direction from Ensemble Score]
+    I --> J[SL/TP/Risk from Top-Scoring Agent]
     J --> L[ActionGating]
     L --> M{Confidence > Threshold?}
     M -->|Yes| N[EXECUTE TRADE]
-    M -->|No| K
+    M -->|No| K[HOLD - No Trade]
 ```
 
 ---
