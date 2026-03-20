@@ -1,11 +1,25 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HEAVY DATA — MUST NOT push (upload via RunPod)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+data/
+models_saved/
+archive/
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Skills (external subrepo)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .agent/skills/
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Secrets
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .env
 *.env
+*.key
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Python
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 __pycache__/
 *.py[cod]
 *$py.class
@@ -13,44 +27,51 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Virtual environments
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .venv/
 venv/
 env/
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # IDE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .idea/
 .vscode/
 *.swp
 *.swo
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # OS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Data files (tracked by DVC)
-data/raw/*.parquet
-data/processed/*.parquet
-*.h5
-*.hdf5
-
-# Model weights (tracked by registry)
-rabit_propfirm_drl/model_registry/models/v*/
-
-# Logs
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Logs & Reports (regenerated)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 logs/
 *.log
 *.jsonl
+reports/
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # W&B
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 wandb/
 
-# DVC
-/data/raw
-/data/processed
-
-# Secrets
-.env
-*.key
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Binary model/data formats
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.pt
+*.pth
+*.onnx

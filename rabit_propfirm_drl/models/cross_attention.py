@@ -371,6 +371,317 @@ class CrossAttentionMTF(nn.Module):
         return weights
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HierarchicalCrossAttentionMTF — 4-TF Intraday Architecture
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class HierarchicalCrossAttentionMTF(nn.Module):
+    """
+    Hierarchical Multi-Timeframe Cross-Attention for Intraday Trading.
+
+    Two-cluster architecture mirroring professional trader cognition:
+
+    ┌──────────────────────────┐    ┌──────────────────────────┐
+    │     ENTRY CLUSTER        │    │    STRUCTURE CLUSTER      │
+    │                          │    │                          │
+    │  M1 (128 bars) ──► deep  │    │  M15 (48 bars) ──► light │
+    │  encoder (TransformerSMC)│    │  encoder (ContextEncoder)│
+    │    = M1 query (128-dim)  │    │    = M15 query (128-dim) │
+    │                          │    │                          │
+    │  M5 (64 bars) ──► light  │    │  H1  (24 bars) ──► light │
+    │  encoder (ContextEncoder)│    │  encoder (ContextEncoder)│
+    │    = M5 context          │    │    = H1 context          │
+    │                          │    │                          │
+    │  CrossAttn: M1(Q)×M5(KV)│    │  CrossAttn: M15(Q)×H1(KV)│
+    │  → entry_latent (128)    │    │  → structure_latent (128)│
+    └──────────┬───────────────┘    └──────────┬───────────────┘
+               │                               │
+               └───────────────┬───────────────┘
+                               │
+                        concat → (256)
+
+    Entry cluster:     "Is there a valid entry signal?" — needs precision
+    Structure cluster: "What's the market context?"     — needs breadth
+
+    Args:
+        n_features_m1:  Features per M1 bar (e.g., 50 = 28 raw + 22 knowledge)
+        n_features_m5:  Features per M5 bar
+        n_features_m15: Features per M15 bar
+        n_features_h1:  Features per H1 bar
+        embed_dim:      Shared embedding dimension (default: 128)
+        n_heads:        Number of attention heads (default: 4)
+        n_cross_layers: Cross-attention depth per cluster (default: 1)
+        dropout:        Dropout rate (default: 0.1)
+        max_len_m1:     Max M1 sequence length (default: 192)
+        max_len_m5:     Max M5 sequence length (default: 128)
+        max_len_m15:    Max M15 sequence length (default: 64)
+        max_len_h1:     Max H1 sequence length (default: 48)
+    """
+
+    def __init__(
+        self,
+        n_features_m1: int,
+        n_features_m5: int,
+        n_features_m15: int,
+        n_features_h1: int,
+        embed_dim: int = 128,
+        n_heads: int = 4,
+        n_cross_layers: int = 1,
+        dropout: float = 0.1,
+        max_len_m1: int = 192,
+        max_len_m5: int = 128,
+        max_len_m15: int = 64,
+        max_len_h1: int = 48,
+    ) -> None:
+        super().__init__()
+
+        assert embed_dim % n_heads == 0, (
+            f"embed_dim ({embed_dim}) must be divisible by n_heads ({n_heads})"
+        )
+
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.n_cross_layers = n_cross_layers
+
+        # ── ENTRY CLUSTER ──
+
+        # M1 gets a deeper encoder because M1 data is noisy.
+        # 2-layer TransformerSMC with full self-attention to filter noise.
+        from models.transformer_smc import TransformerSMC
+
+        self.m1_encoder = TransformerSMC(
+            input_dim=n_features_m1,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            n_layers=2,           # Deep — filters M1 noise
+            dropout=dropout,
+            max_seq_len=max_len_m1,
+        )
+
+        # M5 gets a light context encoder (1 layer) — serves as K/V
+        self.m5_encoder = ContextEncoder(
+            n_features=n_features_m5,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_len_m5,
+        )
+
+        # M1 query projection for cross-attention (separate from TransformerSMC)
+        self.m1_query_projection = nn.Sequential(
+            nn.Linear(n_features_m1, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+        self.m1_query_pos = SinusoidalPositionalEncoding(max_len_m1, embed_dim)
+
+        # Entry cross-attention: M1(Q) × M5(KV)
+        self.entry_cross_attn = nn.ModuleList()
+        self.entry_norms_q = nn.ModuleList()
+        self.entry_norms_kv = nn.ModuleList()
+        self.entry_ff = nn.ModuleList()
+        self.entry_norms_ff = nn.ModuleList()
+
+        for _ in range(n_cross_layers):
+            self.entry_cross_attn.append(
+                nn.MultiheadAttention(
+                    embed_dim=embed_dim, num_heads=n_heads,
+                    dropout=dropout, batch_first=True,
+                )
+            )
+            self.entry_norms_q.append(nn.LayerNorm(embed_dim))
+            self.entry_norms_kv.append(nn.LayerNorm(embed_dim))
+            self.entry_ff.append(nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4), nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 4, embed_dim), nn.Dropout(dropout),
+            ))
+            self.entry_norms_ff.append(nn.LayerNorm(embed_dim))
+
+        self.entry_final_norm = nn.LayerNorm(embed_dim)
+
+        # ── STRUCTURE CLUSTER ──
+
+        # M15 query encoder — light (1 layer context encoder returning sequence)
+        self.m15_encoder = ContextEncoder(
+            n_features=n_features_m15,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_len_m15,
+        )
+
+        # H1 context encoder — light (1 layer)
+        self.h1_encoder = ContextEncoder(
+            n_features=n_features_h1,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_len_h1,
+        )
+
+        # Structure cross-attention: M15(Q) × H1(KV)
+        self.struct_cross_attn = nn.ModuleList()
+        self.struct_norms_q = nn.ModuleList()
+        self.struct_norms_kv = nn.ModuleList()
+        self.struct_ff = nn.ModuleList()
+        self.struct_norms_ff = nn.ModuleList()
+
+        for _ in range(n_cross_layers):
+            self.struct_cross_attn.append(
+                nn.MultiheadAttention(
+                    embed_dim=embed_dim, num_heads=n_heads,
+                    dropout=dropout, batch_first=True,
+                )
+            )
+            self.struct_norms_q.append(nn.LayerNorm(embed_dim))
+            self.struct_norms_kv.append(nn.LayerNorm(embed_dim))
+            self.struct_ff.append(nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4), nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 4, embed_dim), nn.Dropout(dropout),
+            ))
+            self.struct_norms_ff.append(nn.LayerNorm(embed_dim))
+
+        self.struct_final_norm = nn.LayerNorm(embed_dim)
+
+        # ── Output dropout ──
+        self.output_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        m1_features: torch.Tensor,
+        m5_features: torch.Tensor,
+        m15_features: torch.Tensor,
+        h1_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Hierarchical 4-TF forward pass.
+
+        Args:
+            m1_features:  (B, seq_m1, n_features_m1)  — e.g., (32, 128, 50)
+            m5_features:  (B, seq_m5, n_features_m5)  — e.g., (32, 64, 50)
+            m15_features: (B, seq_m15, n_features_m15) — e.g., (32, 48, 50)
+            h1_features:  (B, seq_h1, n_features_h1)  — e.g., (32, 24, 50)
+
+        Returns:
+            Tuple of 3 tensors:
+            - m1_latent:        (B, embed_dim) — M1 self-attention (standalone)
+            - entry_latent:     (B, embed_dim) — M1×M5 cross-attention
+            - structure_latent: (B, embed_dim) — M15×H1 cross-attention
+        """
+        # ══════════════════════════════════════════════════════════════
+        # ENTRY CLUSTER: M1 (deep) × M5 (context)
+        # ══════════════════════════════════════════════════════════════
+
+        # M1 self-attention (standalone latent — captures M1-only patterns)
+        m1_latent = self.m1_encoder(m1_features)  # (B, embed_dim)
+
+        # M5 context encoding (full sequence for K/V)
+        m5_encoded = self.m5_encoder(m5_features)  # (B, seq_m5, embed_dim)
+
+        # M1 query for cross-attention
+        entry_query = self.m1_query_projection(m1_features)  # (B, seq_m1, embed_dim)
+        entry_query = self.m1_query_pos(entry_query)
+
+        # Cross-attention: M1 bars ask M5 bars for confirmation
+        for i in range(self.n_cross_layers):
+            q_normed = self.entry_norms_q[i](entry_query)
+            kv_normed = self.entry_norms_kv[i](m5_encoded)
+            attn_out, _ = self.entry_cross_attn[i](
+                query=q_normed, key=kv_normed, value=kv_normed,
+            )
+            entry_query = entry_query + attn_out
+            ff_normed = self.entry_norms_ff[i](entry_query)
+            entry_query = entry_query + self.entry_ff[i](ff_normed)
+
+        entry_query = self.entry_final_norm(entry_query)
+        entry_latent = entry_query.mean(dim=1)  # (B, embed_dim)
+        entry_latent = self.output_dropout(entry_latent)
+
+        # ══════════════════════════════════════════════════════════════
+        # STRUCTURE CLUSTER: M15 (query) × H1 (context)
+        # ══════════════════════════════════════════════════════════════
+
+        # M15 encoding (returns full sequence for Q)
+        m15_encoded = self.m15_encoder(m15_features)  # (B, seq_m15, embed_dim)
+
+        # H1 context encoding (full sequence for K/V)
+        h1_encoded = self.h1_encoder(h1_features)    # (B, seq_h1, embed_dim)
+
+        # Cross-attention: M15 bars ask H1 bars for trend context
+        struct_query = m15_encoded
+        for i in range(self.n_cross_layers):
+            q_normed = self.struct_norms_q[i](struct_query)
+            kv_normed = self.struct_norms_kv[i](h1_encoded)
+            attn_out, _ = self.struct_cross_attn[i](
+                query=q_normed, key=kv_normed, value=kv_normed,
+            )
+            struct_query = struct_query + attn_out
+            ff_normed = self.struct_norms_ff[i](struct_query)
+            struct_query = struct_query + self.struct_ff[i](ff_normed)
+
+        struct_query = self.struct_final_norm(struct_query)
+        structure_latent = struct_query.mean(dim=1)  # (B, embed_dim)
+        structure_latent = self.output_dropout(structure_latent)
+
+        return m1_latent, entry_latent, structure_latent
+
+    def get_attention_weights(
+        self,
+        m1_features: torch.Tensor,
+        m5_features: torch.Tensor,
+        m15_features: torch.Tensor,
+        h1_features: torch.Tensor,
+    ) -> dict[str, list[torch.Tensor]]:
+        """
+        Extract cross-attention weights for interpretability.
+
+        Returns:
+            Dict with keys "entry" and "structure", each containing a list
+            of attention weight tensors (one per cross-attention layer).
+            Shapes: entry  — (B, n_heads, seq_m1, seq_m5)
+                    struct — (B, n_heads, seq_m15, seq_h1)
+        """
+        # Entry cluster
+        m5_encoded = self.m5_encoder(m5_features)
+        entry_query = self.m1_query_projection(m1_features)
+        entry_query = self.m1_query_pos(entry_query)
+
+        entry_weights: list[torch.Tensor] = []
+        for i in range(self.n_cross_layers):
+            q_normed = self.entry_norms_q[i](entry_query)
+            kv_normed = self.entry_norms_kv[i](m5_encoded)
+            attn_out, attn_w = self.entry_cross_attn[i](
+                query=q_normed, key=kv_normed, value=kv_normed,
+                need_weights=True, average_attn_weights=False,
+            )
+            entry_weights.append(attn_w)
+            entry_query = entry_query + attn_out
+            ff_normed = self.entry_norms_ff[i](entry_query)
+            entry_query = entry_query + self.entry_ff[i](ff_normed)
+
+        # Structure cluster
+        m15_encoded = self.m15_encoder(m15_features)
+        h1_encoded = self.h1_encoder(h1_features)
+
+        struct_weights: list[torch.Tensor] = []
+        struct_query = m15_encoded
+        for i in range(self.n_cross_layers):
+            q_normed = self.struct_norms_q[i](struct_query)
+            kv_normed = self.struct_norms_kv[i](h1_encoded)
+            attn_out, attn_w = self.struct_cross_attn[i](
+                query=q_normed, key=kv_normed, value=kv_normed,
+                need_weights=True, average_attn_weights=False,
+            )
+            struct_weights.append(attn_w)
+            struct_query = struct_query + attn_out
+            ff_normed = self.struct_norms_ff[i](struct_query)
+            struct_query = struct_query + self.struct_ff[i](ff_normed)
+
+        return {"entry": entry_weights, "structure": struct_weights}
+
+
 # ── Legacy aliases for backward compatibility ──
 # Old tests import CrossAttentionFusion and MultiTimeframeEncoder.
 # These wrappers preserve the old API while using new internals.

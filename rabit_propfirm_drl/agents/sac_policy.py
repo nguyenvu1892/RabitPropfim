@@ -1,21 +1,31 @@
 """
-SAC Policy with Transformer Backbone — The "Brain" of the AI Trader.
+SAC Policy with Hierarchical Cross-Attention — The "Brain" of the AI Trader.
 
-Purpose:
-    Replaces the simple MLP prototype with a full neural architecture that
-    can THINK about market context before making decisions.
+v2.0 — Cognitive Architecture Integration:
+    - 4-TF inputs: M1, M5, M15, H1 (no more H4)
+    - 50-dim feature vector per TF (28 raw + 22 knowledge)
+    - HierarchicalCrossAttentionMTF: Entry (M1×M5) + Structure (M15×H1)
+    - EpisodicMemory: auxiliary confidence modifier (OUTSIDE gradient graph)
 
 Architecture Overview:
     ┌────────────────────────────────────────────────────────────────────┐
-    │                    Shared Feature Extractor                       │
+    │                   Hierarchical Feature Extractor                   │
     │                                                                    │
-    │  M5 (64, 28) ──► TransformerSMC ──────────► smc_latent (128)     │
+    │  M1 (128, 50) ──┐                                                 │
+    │                  ├─ HierarchicalCrossAttentionMTF ──┐              │
+    │  M5 (64, 50)  ──┘   Entry: M1(Q)×M5(KV)            │              │
+    │                                                      │              │
+    │  M15 (48, 50) ──┐                                   │              │
+    │                  ├─ Structure: M15(Q)×H1(KV) ───────┤              │
+    │  H1 (24, 50)  ──┘                                   │              │
+    │                                                      ▼              │
+    │  Outputs: m1_latent(128) + entry_latent(128) +                    │
+    │           structure_latent(128)                                     │
     │                                                                    │
-    │  M5 + H1 + H4 ──► CrossAttentionMTF ──────► mtf_latent (128)     │
+    │  m1_latent ──► RegimeDetector ──► regime_emb(128) + probs(4)     │
     │                                                                    │
-    │  smc_latent ──► RegimeDetector ───► regime_emb (128) + probs (4) │
-    │                                                                    │
-    │  global_state = cat[smc_latent, mtf_latent, regime_emb] = (388)  │
+    │  global_state = cat[m1, entry, structure, regime_emb, probs]      │
+    │              = (128 + 128 + 128 + 128 + 4) = 516                  │
     └────────────────────────────────────────────────────────────────────┘
                                 │
                     ┌───────────┴───────────┐
@@ -26,10 +36,16 @@ Architecture Overview:
             │ → (μ, log σ) │       │ → Q(s,a)      │
             │ → tanh(N)    │       │ min(Q1,Q2)    │
             │ → action[4]  │       │               │
-            └──────────────┘       └──────────────┘
+            └──────┬───────┘       └──────────────┘
+                   │
+                   ▼
+            ┌──────────────┐
+            │ Action Gating│  ← EpisodicMemory bonus (NO gradient!)
+            │ confidence ×  │     query(knowledge_vec) → ±0.3
+            │ (1 + bonus)  │
+            └──────────────┘
 
     Action space: [confidence, risk_frac, sl_mult, tp_mult] ∈ [-1, 1]^4
-    Then ActionGating converts confidence to BUY/SELL/HOLD decisions.
 
 All parameters configurable. Zero hardcoding.
 """
@@ -41,8 +57,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-from models.transformer_smc import TransformerSMC
-from models.cross_attention import CrossAttentionMTF
+from models.cross_attention import HierarchicalCrossAttentionMTF
 from models.regime_detector import RegimeDetector
 
 LOG_SIG_MAX = 2
@@ -50,64 +65,56 @@ LOG_SIG_MIN = -20
 EPS = 1e-6
 
 
-class TransformerFeatureExtractor(nn.Module):
+class HierarchicalFeatureExtractor(nn.Module):
     """
-    Shared feature extractor combining all Sprint 3 modules.
+    Shared feature extractor for the Cognitive Architecture.
 
-    This is the "perception system" — it processes raw market data from
-    multiple timeframes and produces a single state vector that captures:
-    1. M5 pattern recognition (TransformerSMC)
-    2. Multi-TF context awareness (CrossAttentionMTF)
-    3. Market regime sensitivity (RegimeDetector)
+    Replaces the old TransformerFeatureExtractor (3-TF, flat attention) with:
+    1. HierarchicalCrossAttentionMTF → m1_latent + entry_latent + structure_latent
+    2. RegimeDetector → regime_emb + regime_probs
 
-    Output: global_state = cat[smc_latent, mtf_latent, regime_emb, regime_probs]
-            Shape: (batch, embed_dim * 3 + n_regimes)
-            Default: (batch, 128*3 + 4) = (batch, 388)
+    Output: global_state = cat[m1_latent, entry_latent, structure_latent,
+                               regime_emb, regime_probs]
+            Shape: (batch, embed_dim * 4 + n_regimes)
+            Default: (batch, 128 * 4 + 4) = (batch, 516)
     """
 
     def __init__(
         self,
-        n_features: int = 28,
+        n_features: int = 50,
         embed_dim: int = 128,
         n_heads: int = 4,
-        n_transformer_layers: int = 2,
         n_cross_layers: int = 1,
         n_regimes: int = 4,
         dropout: float = 0.1,
+        max_seq_m1: int = 192,
         max_seq_m5: int = 128,
+        max_seq_m15: int = 64,
         max_seq_h1: int = 48,
-        max_seq_h4: int = 64,
     ) -> None:
         super().__init__()
 
         self.embed_dim = embed_dim
         self.n_regimes = n_regimes
 
-        # Module 1: TransformerSMC — M5 self-attention
-        self.transformer_smc = TransformerSMC(
-            input_dim=n_features,
-            embed_dim=embed_dim,
-            n_heads=n_heads,
-            n_layers=n_transformer_layers,
-            dropout=dropout,
-            max_seq_len=max_seq_m5,
-        )
-
-        # Module 2: CrossAttentionMTF — M5 × H1/H4
-        self.cross_attention = CrossAttentionMTF(
+        # Module 1: HierarchicalCrossAttentionMTF — 4-TF fusion
+        self.hierarchical_attn = HierarchicalCrossAttentionMTF(
+            n_features_m1=n_features,
             n_features_m5=n_features,
+            n_features_m15=n_features,
             n_features_h1=n_features,
-            n_features_h4=n_features,
             embed_dim=embed_dim,
             n_heads=n_heads,
             n_cross_layers=n_cross_layers,
             dropout=dropout,
+            max_len_m1=max_seq_m1,
             max_len_m5=max_seq_m5,
+            max_len_m15=max_seq_m15,
             max_len_h1=max_seq_h1,
-            max_len_h4=max_seq_h4,
         )
 
-        # Module 3: RegimeDetector — market state classifier
+        # Module 2: RegimeDetector — market state classifier
+        # Uses m1_latent (the deepest-encoded signal) as input
         self.regime_detector = RegimeDetector(
             input_dim=embed_dim,
             n_regimes=n_regimes,
@@ -115,67 +122,65 @@ class TransformerFeatureExtractor(nn.Module):
             dropout=dropout,
         )
 
-        # Output dimension: smc_latent + mtf_latent + regime_emb + regime_probs
-        self.output_dim = embed_dim * 3 + n_regimes  # 128 + 128 + 128 + 4 = 388
+        # Output dimension:
+        # m1_latent + entry_latent + structure_latent + regime_emb + regime_probs
+        self.output_dim = embed_dim * 4 + n_regimes  # 128*4 + 4 = 516
 
     def forward(
         self,
+        m1_features: torch.Tensor,
         m5_features: torch.Tensor,
+        m15_features: torch.Tensor,
         h1_features: torch.Tensor,
-        h4_features: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Extract global state from multi-timeframe features.
+        Extract global state from 4-TF features.
 
         Args:
-            m5_features: (batch, seq_m5, n_features) — M5 candle features
-            h1_features: (batch, seq_h1, n_features) — H1 context features
-            h4_features: (batch, seq_h4, n_features) — H4 context features
+            m1_features:  (batch, seq_m1, n_features)
+            m5_features:  (batch, seq_m5, n_features)
+            m15_features: (batch, seq_m15, n_features)
+            h1_features:  (batch, seq_h1, n_features)
 
         Returns:
-            (batch, output_dim=388) — global state vector
+            (batch, output_dim=516) — global state vector
         """
-        # Step 1: TransformerSMC — M5 pattern recognition
-        # "Which FVG/OB/BOS patterns in this M5 window are important?"
-        smc_latent = self.transformer_smc(m5_features)  # (B, 128)
+        # Step 1: Hierarchical Cross-Attention
+        # Entry cluster: M1(Q) × M5(KV) → precise entry timing
+        # Structure cluster: M15(Q) × H1(KV) → market context
+        m1_latent, entry_latent, structure_latent = self.hierarchical_attn(
+            m1_features, m5_features, m15_features, h1_features,
+        )  # each (B, 128)
 
-        # Step 2: CrossAttentionMTF — Multi-TF awareness
-        # "How does the H4/H1 structure align with M5 patterns?"
-        mtf_latent = self.cross_attention(
-            m5_features, h1_features, h4_features
-        )  # (B, 128)
+        # Step 2: RegimeDetector — from M1 deep representation
+        # "Is the market trending, ranging, or volatile?"
+        regime_probs, regime_emb = self.regime_detector(m1_latent)
+        # regime_probs: (B, 4), regime_emb: (B, 128)
 
-        # Step 3: RegimeDetector — Market regime
-        # "Is the market trending, ranging, or volatile right now?"
-        regime_probs, regime_emb = self.regime_detector(smc_latent)  # (B, 4), (B, 128)
-
-        # Step 4: Concatenate into global state
-        # [smc_latent | mtf_latent | regime_emb | regime_probs]
+        # Step 3: Concatenate all into global state
         global_state = torch.cat(
-            [smc_latent, mtf_latent, regime_emb, regime_probs], dim=-1
-        )  # (B, 388)
+            [m1_latent, entry_latent, structure_latent, regime_emb, regime_probs],
+            dim=-1,
+        )  # (B, 516)
 
         return global_state
 
 
 class SACTransformerActor(nn.Module):
     """
-    SAC Actor with Transformer backbone.
+    SAC Actor with Hierarchical Cross-Attention backbone.
 
-    Replaces the old MLP Actor with:
-    1. TransformerFeatureExtractor → global_state (388-dim)
-    2. MLP Head → (mean, log_std) → Squashed Gaussian
+    v2.0: 4-TF inputs, 50-dim features, 516-dim global state.
 
     Output: tanh-squashed actions in [-1, 1]^4
     """
 
     def __init__(
         self,
-        n_features: int = 28,
+        n_features: int = 50,
         action_dim: int = 4,
         embed_dim: int = 128,
         n_heads: int = 4,
-        n_transformer_layers: int = 2,
         n_cross_layers: int = 1,
         n_regimes: int = 4,
         hidden_dims: list[int] | None = None,
@@ -184,11 +189,10 @@ class SACTransformerActor(nn.Module):
         super().__init__()
 
         # Shared feature extractor
-        self.feature_extractor = TransformerFeatureExtractor(
+        self.feature_extractor = HierarchicalFeatureExtractor(
             n_features=n_features,
             embed_dim=embed_dim,
             n_heads=n_heads,
-            n_transformer_layers=n_transformer_layers,
             n_cross_layers=n_cross_layers,
             n_regimes=n_regimes,
             dropout=dropout,
@@ -212,25 +216,27 @@ class SACTransformerActor(nn.Module):
 
     def forward(
         self,
+        m1: torch.Tensor,
         m5: torch.Tensor,
+        m15: torch.Tensor,
         h1: torch.Tensor,
-        h4: torch.Tensor,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass: raw features → action + log_prob.
+        Forward pass: 4-TF raw features → action + log_prob.
 
         Args:
-            m5: (batch, seq_m5, n_features)
-            h1: (batch, seq_h1, n_features)
-            h4: (batch, seq_h4, n_features)
+            m1:  (batch, seq_m1, n_features)  — M1 candle features (50-dim)
+            m5:  (batch, seq_m5, n_features)  — M5 candle features
+            m15: (batch, seq_m15, n_features) — M15 context features
+            h1:  (batch, seq_h1, n_features)  — H1 context features
             deterministic: If True, return mean action (no sampling)
 
         Returns:
             (action, log_prob) — action: (batch, 4), log_prob: (batch, 1)
         """
-        # Extract features through Transformer pipeline
-        global_state = self.feature_extractor(m5, h1, h4)  # (B, 388)
+        # Extract features through Hierarchical pipeline
+        global_state = self.feature_extractor(m1, m5, m15, h1)  # (B, 516)
 
         # MLP head
         features = self.trunk(global_state)
@@ -260,31 +266,31 @@ class SACTransformerActor(nn.Module):
 
     def get_global_state(
         self,
+        m1: torch.Tensor,
         m5: torch.Tensor,
+        m15: torch.Tensor,
         h1: torch.Tensor,
-        h4: torch.Tensor,
     ) -> torch.Tensor:
-        """Extract global state (for critic input)."""
-        return self.feature_extractor(m5, h1, h4)
+        """Extract global state (for critic input sharing, if needed)."""
+        return self.feature_extractor(m1, m5, m15, h1)
 
 
 class SACTransformerCritic(nn.Module):
     """
-    Twin Q-Critic with Transformer backbone.
+    Twin Q-Critic with Hierarchical Cross-Attention backbone.
 
-    Shares the same feature extractor architecture as the Actor,
-    but maintains separate weights (no parameter sharing).
+    Shares the same architecture as the Actor, but maintains
+    separate weights (no parameter sharing).
 
     Q(s, a) = MLP(cat[global_state, action]) → scalar
     """
 
     def __init__(
         self,
-        n_features: int = 28,
+        n_features: int = 50,
         action_dim: int = 4,
         embed_dim: int = 128,
         n_heads: int = 4,
-        n_transformer_layers: int = 2,
         n_cross_layers: int = 1,
         n_regimes: int = 4,
         hidden_dims: list[int] | None = None,
@@ -293,11 +299,10 @@ class SACTransformerCritic(nn.Module):
         super().__init__()
 
         # Separate feature extractor (NOT shared with actor)
-        self.feature_extractor = TransformerFeatureExtractor(
+        self.feature_extractor = HierarchicalFeatureExtractor(
             n_features=n_features,
             embed_dim=embed_dim,
             n_heads=n_heads,
-            n_transformer_layers=n_transformer_layers,
             n_cross_layers=n_cross_layers,
             n_regimes=n_regimes,
             dropout=dropout,
@@ -312,7 +317,7 @@ class SACTransformerCritic(nn.Module):
 
     @staticmethod
     def _build_q_net(
-        state_dim: int, action_dim: int, hidden_dims: list[int]
+        state_dim: int, action_dim: int, hidden_dims: list[int],
     ) -> nn.Sequential:
         """Build a single Q-network: (state + action) → Q-value."""
         layers: list[nn.Module] = []
@@ -326,32 +331,77 @@ class SACTransformerCritic(nn.Module):
 
     def forward(
         self,
+        m1: torch.Tensor,
         m5: torch.Tensor,
+        m15: torch.Tensor,
         h1: torch.Tensor,
-        h4: torch.Tensor,
         action: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Twin Q-value forward pass.
 
         Args:
-            m5, h1, h4: Multi-TF feature sequences
+            m1, m5, m15, h1: 4-TF feature sequences
             action: (batch, action_dim=4)
 
         Returns:
             (Q1, Q2) — both (batch, 1)
         """
-        global_state = self.feature_extractor(m5, h1, h4)
+        global_state = self.feature_extractor(m1, m5, m15, h1)
         sa = torch.cat([global_state, action], dim=-1)
         return self.q1(sa), self.q2(sa)
 
     def min_q(
         self,
+        m1: torch.Tensor,
         m5: torch.Tensor,
+        m15: torch.Tensor,
         h1: torch.Tensor,
-        h4: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
         """min(Q1, Q2) — conservative Q-estimate for SAC."""
-        q1, q2 = self.forward(m5, h1, h4, action)
+        q1, q2 = self.forward(m1, m5, m15, h1, action)
         return torch.min(q1, q2)
+
+
+def apply_episodic_memory_bonus(
+    raw_confidence: float,
+    memory_bonus: float,
+) -> float:
+    """
+    Apply EpisodicMemory bonus to raw confidence score.
+
+    CRITICAL: This function operates OUTSIDE the gradient graph.
+    It must ONLY be called during inference/action-gating, NEVER
+    inside a loss function or backprop path.
+
+    The bonus adjusts the agent's confidence by up to ±30%, making
+    it more/less likely to cross the action gating threshold.
+
+    Args:
+        raw_confidence: Agent's raw confidence output from Actor [-1, 1]
+        memory_bonus: Float from EpisodicMemory.query() in [-0.3, +0.3]
+
+    Returns:
+        Adjusted confidence in [-1, 1]
+
+    Example:
+        Agent outputs confidence = 0.25 (below 0.3 threshold → HOLD)
+        Memory bonus = +0.1 (similar setups were profitable)
+        Adjusted = 0.25 * (1 + 0.1) = 0.275 → still HOLD
+
+        Agent outputs confidence = 0.35 (above threshold → BUY)
+        Memory bonus = -0.2 (similar setups lost money)
+        Adjusted = 0.35 * (1 - 0.2) = 0.28 → HOLD (memory prevented bad trade!)
+    """
+    # Scale confidence by memory bonus
+    adjusted = raw_confidence * (1.0 + memory_bonus)
+
+    # Clamp back to [-1, 1]
+    return max(-1.0, min(1.0, adjusted))
+
+
+# ── Legacy backward compatibility ──
+# Old code may reference TransformerFeatureExtractor from this module.
+# Map to the new class with the same interface shape.
+TransformerFeatureExtractor = HierarchicalFeatureExtractor

@@ -1,17 +1,24 @@
 """
 DataFeedManager — Real-time multi-timeframe OHLCV polling from MT5.
 
+v2.0 — Cognitive Architecture (Intraday):
+    - 4 timeframes: M1, M5, M15, H1 (no more H4)
+    - M1 lookback: 128 bars (for deep TransformerSMC encoding)
+    - M5 lookback: 96 bars (8h of M5 data)
+    - M15 lookback: 48 bars (12h of M15 data)
+    - H1 lookback: 24 bars (24h of H1 data)
+
 Responsibility:
     - Poll MT5 every POLL_INTERVAL_SEC for new M5 candles
-    - Maintain rolling buffers of M5, H1, H4 OHLCV data
+    - Maintain rolling buffers of M1, M5, M15, H1 OHLCV data
     - Detect new bar close → trigger signal for inference
     - Validate data integrity (gaps, NaN, stale data)
 
 Design Decisions:
     - POLLING (not callback): MT5 Python API has no event-driven tick API.
-      We poll every 5s which is fast enough for M5 bars (300s each).
-    - BUFFER SIZES: Sized to match model input requirements from training.
-      M5=96 (8h), H1=48 (2d), H4=24 (4d).
+      We poll every 3s (faster than v1 for intraday sensitivity).
+    - BUFFER SIZES: Sized to match model input requirements.
+      M1=128 bars for deep noise-filtering encoder.
     - STALE DATA PROTECTION: If the latest bar timestamp is older than
       expected, we flag data as stale and refuse to trigger inference.
 
@@ -60,11 +67,12 @@ N_OHLCV_COLS = 6  # time, open, high, low, close, tick_volume
 # ─── Data Types ────────────────────────────────────────────────────
 @dataclass
 class BarData:
-    """Container for multi-timeframe OHLCV data."""
+    """Container for multi-timeframe OHLCV data (4 TFs)."""
 
-    m5: np.ndarray       # (N_m5, 6) — [time, O, H, L, C, volume]
-    h1: np.ndarray       # (N_h1, 6)
-    h4: np.ndarray       # (N_h4, 6)
+    m1: np.ndarray        # (N_m1, 6) — [time, O, H, L, C, volume]
+    m5: np.ndarray        # (N_m5, 6)
+    m15: np.ndarray       # (N_m15, 6)
+    h1: np.ndarray        # (N_h1, 6)
     timestamp: datetime   # Timestamp of latest M5 bar
     symbol: str
 
@@ -75,9 +83,10 @@ class FeedHealth:
 
     is_healthy: bool
     last_bar_time: Optional[datetime] = None
+    bars_received_m1: int = 0
     bars_received_m5: int = 0
+    bars_received_m15: int = 0
     bars_received_h1: int = 0
-    bars_received_h4: int = 0
     staleness_seconds: float = 0.0
     error: str = ""
 
@@ -89,26 +98,29 @@ class DataFeedError(Exception):
 # ─── DataFeedManager ──────────────────────────────────────────────
 class DataFeedManager:
     """
-    Manages real-time multi-timeframe OHLCV data from MT5.
+    Manages real-time 4-timeframe OHLCV data from MT5.
+
+    v2.0: M1/M5/M15/H1 (no H4). Optimized for intraday/scalping.
 
     Usage:
         feed = DataFeedManager("XAUUSD")
         has_new, data = feed.poll()
         if has_new and data is not None:
-            # Process data.m5, data.h1, data.h4
+            # Process data.m1, data.m5, data.m15, data.h1
             ...
 
     Poll Interval:
-        Call poll() every POLL_INTERVAL_SEC (5s default).
+        Call poll() every POLL_INTERVAL_SEC (3s default).
         Returns (True, BarData) only when a NEW M5 bar has closed.
         Otherwise returns (False, None).
     """
 
-    # Class-level constants (match design doc)
-    POLL_INTERVAL_SEC: float = 5.0
-    M5_BARS_NEEDED: int = 96     # 96 × 5min = 8 hours lookback
-    H1_BARS_NEEDED: int = 48     # 48 × 1h   = 2 days lookback
-    H4_BARS_NEEDED: int = 24     # 24 × 4h   = 4 days lookback
+    # Class-level constants
+    POLL_INTERVAL_SEC: float = 3.0       # Faster for intraday
+    M1_BARS_NEEDED: int = 128            # 128 × 1min = ~2h lookback (deep encoder)
+    M5_BARS_NEEDED: int = 96             # 96 × 5min = 8h lookback
+    M15_BARS_NEEDED: int = 48            # 48 × 15min = 12h lookback
+    H1_BARS_NEEDED: int = 24             # 24 × 1h = 24h lookback
 
     # Stale data threshold: if latest bar is older than this, refuse inference
     STALENESS_THRESHOLD_SEC: float = 600.0  # 10 minutes
@@ -135,17 +147,19 @@ class DataFeedManager:
         self._consecutive_errors: int = 0
 
         # OHLCV caches (preserved between polls for fast access)
+        self._m1_cache: Optional[np.ndarray] = None
         self._m5_cache: Optional[np.ndarray] = None
+        self._m15_cache: Optional[np.ndarray] = None
         self._h1_cache: Optional[np.ndarray] = None
-        self._h4_cache: Optional[np.ndarray] = None
 
         logger.info(
-            "DataFeedManager initialized: symbol=%s, "
-            "buffers=[M5×%d, H1×%d, H4×%d], poll_interval=%.1fs",
+            "DataFeedManager v2.0 initialized: symbol=%s, "
+            "buffers=[M1×%d, M5×%d, M15×%d, H1×%d], poll_interval=%.1fs",
             self.symbol,
+            self.M1_BARS_NEEDED,
             self.M5_BARS_NEEDED,
+            self.M15_BARS_NEEDED,
             self.H1_BARS_NEEDED,
-            self.H4_BARS_NEEDED,
             self.POLL_INTERVAL_SEC,
         )
 
@@ -161,9 +175,6 @@ class DataFeedManager:
             (has_new_bar, BarData | None)
             - (True, BarData) when a new M5 candle has closed
             - (False, None) when no new bar detected or error occurred
-
-        This method is designed to be called in a tight loop.
-        It handles all internal errors gracefully (logs + returns False).
         """
         self._poll_count += 1
 
@@ -186,21 +197,31 @@ class DataFeedManager:
             self._last_m5_time = latest_time
             self._m5_cache = self._structured_to_ohlcv(rates_m5)
 
-            # Fetch H1 and H4
+            # Fetch M1 (128 bars — most critical for sniper entry)
+            rates_m1 = self._fetch_rates(mt5.TIMEFRAME_M1, self.M1_BARS_NEEDED)
+            if rates_m1 is not None:
+                self._m1_cache = self._structured_to_ohlcv(rates_m1)
+            else:
+                logger.warning(
+                    "[%s] M1 data unavailable — using cached data", self.symbol
+                )
+
+            # Fetch M15
+            rates_m15 = self._fetch_rates(mt5.TIMEFRAME_M15, self.M15_BARS_NEEDED)
+            if rates_m15 is not None:
+                self._m15_cache = self._structured_to_ohlcv(rates_m15)
+            else:
+                logger.warning(
+                    "[%s] M15 data unavailable — using cached data", self.symbol
+                )
+
+            # Fetch H1
             rates_h1 = self._fetch_rates(mt5.TIMEFRAME_H1, self.H1_BARS_NEEDED)
             if rates_h1 is not None:
                 self._h1_cache = self._structured_to_ohlcv(rates_h1)
             else:
                 logger.warning(
                     "[%s] H1 data unavailable — using cached data", self.symbol
-                )
-
-            rates_h4 = self._fetch_rates(mt5.TIMEFRAME_H4, self.H4_BARS_NEEDED)
-            if rates_h4 is not None:
-                self._h4_cache = self._structured_to_ohlcv(rates_h4)
-            else:
-                logger.warning(
-                    "[%s] H4 data unavailable — using cached data", self.symbol
                 )
 
             # ── Validate caches ──
@@ -220,21 +241,23 @@ class DataFeedManager:
 
             # ── Build result ──
             bar_data = BarData(
+                m1=self._m1_cache.copy(),
                 m5=self._m5_cache.copy(),
+                m15=self._m15_cache.copy(),
                 h1=self._h1_cache.copy(),
-                h4=self._h4_cache.copy(),
                 timestamp=latest_time,
                 symbol=self.symbol,
             )
 
             self._consecutive_errors = 0
             logger.debug(
-                "[%s] New M5 bar @ %s | M5=%d H1=%d H4=%d",
+                "[%s] New M5 bar @ %s | M1=%d M5=%d M15=%d H1=%d",
                 self.symbol,
                 latest_time.strftime("%H:%M:%S"),
+                len(self._m1_cache),
                 len(self._m5_cache),
+                len(self._m15_cache),
                 len(self._h1_cache),
-                len(self._h4_cache),
             )
             return True, bar_data
 
@@ -261,14 +284,16 @@ class DataFeedManager:
             self._consecutive_errors < 5
             and staleness < self.STALENESS_THRESHOLD_SEC
             and self._m5_cache is not None
+            and self._m1_cache is not None
         )
 
         return FeedHealth(
             is_healthy=is_healthy,
             last_bar_time=self._last_m5_time,
+            bars_received_m1=len(self._m1_cache) if self._m1_cache is not None else 0,
             bars_received_m5=len(self._m5_cache) if self._m5_cache is not None else 0,
+            bars_received_m15=len(self._m15_cache) if self._m15_cache is not None else 0,
             bars_received_h1=len(self._h1_cache) if self._h1_cache is not None else 0,
-            bars_received_h4=len(self._h4_cache) if self._h4_cache is not None else 0,
             staleness_seconds=staleness,
             error="" if is_healthy else f"errors={self._consecutive_errors}",
         )
@@ -276,9 +301,10 @@ class DataFeedManager:
     def reset(self) -> None:
         """Reset all internal state and caches. Use when switching symbol."""
         self._last_m5_time = None
+        self._m1_cache = None
         self._m5_cache = None
+        self._m15_cache = None
         self._h1_cache = None
-        self._h4_cache = None
         self._consecutive_errors = 0
         logger.info("[%s] DataFeedManager reset", self.symbol)
 
@@ -322,13 +348,13 @@ class DataFeedManager:
             return False
 
     def _fetch_rates(
-        self, timeframe: int, count: int
+        self, timeframe: int, count: int,
     ) -> Optional[np.ndarray]:
         """
         Fetch OHLCV rates from MT5.
 
         Args:
-            timeframe: MT5 timeframe constant (mt5.TIMEFRAME_M5, etc.)
+            timeframe: MT5 timeframe constant (mt5.TIMEFRAME_M1, etc.)
             count: Number of bars to fetch
 
         Returns:
@@ -384,10 +410,6 @@ class DataFeedManager:
         """
         Convert MT5 structured array to plain OHLCV numpy array.
 
-        MT5 returns: dtype=[('time','<i8'), ('open','<f8'), ('high','<f8'),
-                            ('low','<f8'), ('close','<f8'), ('tick_volume','<i8'),
-                            ('spread','<i4'), ('real_volume','<i8')]
-
         We extract: [time, open, high, low, close, tick_volume] → (N, 6)
         """
         ohlcv = np.column_stack([
@@ -402,11 +424,7 @@ class DataFeedManager:
 
     @staticmethod
     def _extract_bar_time(rate_entry) -> datetime:
-        """
-        Extract datetime from a single MT5 rate entry.
-
-        MT5 returns time as Unix timestamp (int64).
-        """
+        """Extract datetime from a single MT5 rate entry."""
         timestamp = int(rate_entry['time'])
         return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
@@ -426,57 +444,33 @@ class DataFeedManager:
         - No NaN values in price columns
         - Prices are positive
         """
-        if self._m5_cache is None:
-            logger.error("[%s] M5 cache is None after fetch", self.symbol)
-            return False
+        caches = {
+            "M1": (self._m1_cache, 20),
+            "M5": (self._m5_cache, 20),
+            "M15": (self._m15_cache, 10),
+            "H1": (self._h1_cache, 5),
+        }
 
-        if self._h1_cache is None:
-            logger.error("[%s] H1 cache is None", self.symbol)
-            return False
+        for name, (cache, min_bars) in caches.items():
+            if cache is None:
+                logger.error("[%s] %s cache is None", self.symbol, name)
+                return False
 
-        if self._h4_cache is None:
-            logger.error("[%s] H4 cache is None", self.symbol)
-            return False
+            if len(cache) < min_bars:
+                logger.error(
+                    "[%s] %s bars too few: %d < %d",
+                    self.symbol, name, len(cache), min_bars,
+                )
+                return False
 
-        # Minimum bar counts
-        min_m5 = 20  # Need at least 20 bars for ATR and features
-        min_h1 = 10
-        min_h4 = 5
-
-        if len(self._m5_cache) < min_m5:
-            logger.error(
-                "[%s] M5 bars too few: %d < %d",
-                self.symbol, len(self._m5_cache), min_m5,
-            )
-            return False
-
-        if len(self._h1_cache) < min_h1:
-            logger.error(
-                "[%s] H1 bars too few: %d < %d",
-                self.symbol, len(self._h1_cache), min_h1,
-            )
-            return False
-
-        if len(self._h4_cache) < min_h4:
-            logger.error(
-                "[%s] H4 bars too few: %d < %d",
-                self.symbol, len(self._h4_cache), min_h4,
-            )
-            return False
-
-        # NaN check on price columns (indices 1-4: O, H, L, C)
-        for name, cache in [
-            ("M5", self._m5_cache),
-            ("H1", self._h1_cache),
-            ("H4", self._h4_cache),
-        ]:
-            prices = cache[:, 1:5]  # Open, High, Low, Close
+            # NaN check on price columns (indices 1-4: O, H, L, C)
+            prices = cache[:, 1:5]
             if np.any(np.isnan(prices)):
                 logger.error("[%s] NaN found in %s price data!", self.symbol, name)
                 return False
             if np.any(prices <= 0):
                 logger.error(
-                    "[%s] Non-positive prices in %s data!", self.symbol, name
+                    "[%s] Non-positive prices in %s data!", self.symbol, name,
                 )
                 return False
 

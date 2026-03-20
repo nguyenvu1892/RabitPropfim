@@ -4,6 +4,110 @@
 
 ---
 
+## 20/03/2026
+
+### [COGNITIVE] Phase 3: Data Pipeline & Curriculum Training — 20/03/2026 11:52
+- **Sửa `scripts/fetch_historical_data.py`** v3.0:
+  - Fetch trực tiếp 4 TF từ MT5 (không resample): M1 × 250K, M5 × 50K, M15 × 17K, H1 × 4200
+  - M1 fetch batched (50K/batch) → tránh MT5 timeout
+  - Build 28 raw features (build_features) + 22 knowledge (KnowledgeExtractor) = **50-dim per bar**
+  - Generate `normalizer_v3.json` (per-TF Welford stats)
+  - Output: `{symbol}_{TF}_50dim.npy` files
+- **Viết `scripts/train_curriculum.py`** — 3-stage curriculum:
+
+| Stage | Name | Steps | TFs | Freeze | LR | EpisodicMemory |
+|-------|------|-------|-----|--------|----|----------------|
+| 1 | Context | 200K | M15+H1 | M1,M5,Entry | 3e-4 | OFF |
+| 2 | Precision | 300K | M5+M15+H1 | M1,Structure | 1e-4 | OFF |
+| 3 | Full Fusion | 500K | ALL | None | 5e-5 | ON |
+
+  - Progressive Freezing: Anti-Catastrophic-Forgetting
+  - Warm-start chain: Stage N loads best weights từ Stage N-1
+  - `--test` flag: 100 steps quick validation
+  - `--resume-stage N`: resume từ bất kỳ stage nào
+- **Tests:** Syntax OK (2/2), `--test` PASS (100 steps, 2 checkpoints, best_TestStage.pt 12.5MB)
+
+- **Sửa `agents/sac_policy.py`**: `HierarchicalFeatureExtractor` (516-dim global state)
+  - 4-TF inputs: M1/M5/M15/H1 × 50-dim (28 raw + 22 knowledge)
+  - Actor: 1,439,884 params → action (B, 4) + log_prob
+  - Critic: 1,638,534 params → twin Q-values
+  - `apply_episodic_memory_bonus()`: NGOÀI gradient graph, ±30% confidence modifier
+- **Sửa `environments/prop_env.py`**: `MultiTFTradingEnv` (Dict obs space)
+  - Obs: {m1: (128,50), m5: (64,50), m15: (48,50), h1: (24,50)}
+  - M5 drives stepping, M1/M15/H1 aligned by timestamp ratio
+  - Session close tất cả lệnh khi hour ≥ 22:00
+  - Zero-padding khi window ngắn hơn lookback
+- **Sửa `live_execution/data_feed.py`**: 4-TF polling
+  - M1 × 128 bars, M5 × 96, M15 × 48, H1 × 24
+  - Poll interval: 3s (nhanh hơn v1: 5s)
+  - Xóa hoàn toàn H4
+- **Tests:** Syntax OK (3/3), Functional PASS (3/3), Env stepped OK (4 trades/10 steps)
+
+### [PIVOT] Cognitive Architecture — 3 Trụ Cột Nhận Thức — 20/03/2026 10:10
+- **Branch:** `feature/cognitive-architecture` (checkout từ `main`)
+- **Quyết định:** Pivot từ Swing (M5/H1/H4, WR=34.9%) sang Intraday/Scalping (M1/M5/M15/H1, target WR≥55%)
+- **Thiết kế:** `docs/COGNITIVE_ARCHITECTURE.md` — Top-Down Analysis + Curriculum Learning
+- **3 Module mới:**
+  - `features/knowledge_extractor.py`: **22 biến ngữ nghĩa** (SMC 7 + PA 8 + Vol 5 + Ctx 2)
+    - SMC: `distance_to_ob`, `is_in_fvg`, `trend_state` (BOS/CHoCH), `liquidity_grab`, `swing_distance`
+    - PA: `is_pinbar`, `is_doji`, `is_inside_bar`, `is_engulfing_bull/bear`, `is_hammer`, `is_shooting_star`, `candle_strength`
+    - Vol: `vol_anomaly`, `vol_exhaustion`, `vol_climax`, `vol_trend`, `delta_approx`
+    - NumPy vectorized, <1ms/bar ✅
+  - `agents/episodic_memory.py`: **k-NN Memory Bank** (500 entries, cosine similarity)
+    - Bonus ∈ [-0.3, +0.3] — auxiliary signal, không override Agent
+    - Cold start protection: bonus=0 khi <50 entries
+    - JSON save/load persistence ✅
+  - `models/cross_attention.py`: **HierarchicalCrossAttentionMTF** (1,226,496 params)
+    - Entry cluster: M1(Q=128 bars) × M5(KV=64 bars) → entry_latent (128-dim)
+    - Structure cluster: M15(Q=48 bars) × H1(KV=24 bars) → structure_latent (128-dim)
+    - M1 encoder: TransformerSMC 2-layer (deep, lọc noise)
+    - M5/M15/H1 encoders: ContextEncoder 1-layer (light)
+    - Gradient flow all 4 inputs ✅
+- Feature vector: **50-dim** (28 raw + 22 knowledge) per timeframe
+- Backward compat: Old `CrossAttentionMTF` (3-TF) untouched
+- **Tests:** Syntax OK (3/3), Functional PASS (3/3)
+- **Trạng thái:** Phase 1 DONE. Phase 2 (Policy+DataPipeline) pending.
+
+### [PIVOT] Intraday Architecture Plan — 20/03/2026 09:30
+- **Branch:** `feature/intraday-pivot` (docs only, archived)
+- `docs/PIVOT_INTRADAY_PLAN.md`: Thiết kế 4-TF intraday (M1/M5/M15/H1)
+- Quyết định: Hierarchical Fusion thay Flat 4-Way Attention
+- VRAM estimate: ~8MB (L40 48GB dư sức)
+
+### [FIX] Xóa Hardcoded Fixed Lot XAUUSD — 20/03/2026 08:00
+- `docs/SPRINT_6_MT5_BRIDGE_DESIGN.md`: Bỏ `[!IMPORTANT]` fixed_lot 0.01 → `[!NOTE]` Dynamic Sizing
+- `live_execution/order_calculator.py`: Xóa `symbol_overrides`, `fixed_lot` check
+- **Tất cả symbols dùng 100% Dynamic Lot Sizing (ATR-based)**
+
+### [TEST] Ensemble Holdout Backtest — 5/5 PASS — 20/03/2026 08:34
+- `scripts/backtest_ensemble.py`: Holdout backtest cho 3 Specialist models
+- **Kết quả:**
+
+| Symbol | WR | Sharpe | MaxDD | Return | Trades | PF |
+|--------|-----|--------|-------|--------|--------|-----|
+| BTCUSD | 30.8% | 2.07 | 6.42% | +3.32% | 172 | 1.15 |
+| ETHUSD | 30.6% | 4.38 | 4.98% | +13.56% | 232 | 1.33 |
+| US100 | 39.6% | 9.33 | 2.13% | +7.48% | 106 | 2.03 |
+| US30 | 45.3% | 7.99 | 1.46% | +2.29% | 53 | 1.73 |
+| XAUUSD | 38.2% | 8.30 | 5.17% | +16.64% | 204 | 1.76 |
+
+- **Aggregate:** Sharpe=6.41, Worst DD=6.42% (<8% FTMO), PF=1.60, avg RR=1.87
+- FTMO Gate: **Sharpe ✅ PASS, MaxDD ✅ PASS**, WR ⚠️ 34.9% (trend-following profile)
+- Report: `reports/ensemble_backtest_report.txt`
+
+### [SPRINT 6] MT5 Live Execution Utility Modules — 20/03/2026 01:00
+- `docs/SPRINT_6_MT5_BRIDGE_DESIGN.md`: Kiến trúc cầu nối MT5
+- `live_execution/data_feed.py`: DataFeedManager (M5/H1/H4 polling, bar alignment)
+- `live_execution/connection_guard.py`: ConnectionGuard (3-tier auto-reconnect)
+- `live_execution/order_calculator.py`: OrderCalculator + SlippageHandler (dynamic lot, requote handling)
+
+### [SPRINT 5] Train 3 Specialist Models — 19/03/2026 23:00
+- `scripts/train_specialists.py`: Parallel training (TrendAgent, RangeAgent, VolatilityAgent)
+- Models saved: `best_trendagent.pt` (930K), `best_rangeagent.pt` (520K), `best_volatilityagent.pt` (740K)
+- Trained on L40 with specialized reward shaping per regime
+
+---
+
 ### [SPRINT 4.5] Safe Nightly Retrain -- 19/03/2026 20:15
 - `training_pipeline/safe_retrain.py`: MixedSampler (20/80) + SafeNightlyRetrainer
   - Fine-tune: lr=1e-5, grad_clip=0.5, max 5 epochs
