@@ -23,7 +23,7 @@ unrealized_shaping_weight: 0.1  # Weight for unrealized PnL shaping
 rr_bonus_threshold: 1.5         # Minimum RR ratio for bonus
 rr_bonus_coefficient: 0.3       # Bonus multiplier for good RR
 overtrading_penalty: -0.5       # Per-trade penalty when exceeding max
-inaction_nudge: -0.01           # Light penalty for excessive inaction
+inaction_nudge: -0.5            # Strong penalty for excessive inaction (was -0.01)
 inaction_threshold_steps: 500   # Steps before inaction penalty kicks in
 
 # Drawdown Penalty (Exponential)
@@ -31,8 +31,19 @@ dd_penalty_alpha: 2.0           # Penalty base coefficient
 dd_penalty_beta: 3.0            # Exponential growth rate
 dd_penalty_start: 0.02          # Start penalizing from 2% DD
 
-# Action Gating
-confidence_threshold: 0.3       # |confidence| must exceed this to trade
+# Action Gating — Dual Entry System (M1 Sniper + M5 Normal)
+confidence_threshold: 0.15      # Legacy fallback (overridden by dual thresholds below)
+m5_normal_threshold: 0.50       # |confidence| >= 0.50 + entry_type < 0 => M5 Normal Entry
+m1_sniper_threshold: 0.85       # |confidence| >= 0.85 + entry_type > 0 => M1 Sniper Entry
+
+# ─── Asymmetric Reward (Sniper 5:1 Normal) ───
+sniper_win_multiplier: 5.0      # Sniper M1 win reward multiplier (vs 1.0 for M5)
+sniper_loss_multiplier: 3.0     # Sniper M1 loss penalty multiplier (vs 1.0 for M5)
+
+# ─── FOMO Oracle (training only, NOT used in live inference) ───
+fomo_penalty: -5.0              # Penalty for missing obvious M1 setup
+fomo_lookahead_steps: 50        # Bars to look ahead for oracle
+fomo_move_threshold_pct: 0.005  # 0.5% price move = "obvious setup"
 
 # ─── Strict Risk Management ───
 max_loss_per_trade_pct: 0.003    # 0.3% max loss per single trade

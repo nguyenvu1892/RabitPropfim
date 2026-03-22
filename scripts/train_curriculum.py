@@ -353,12 +353,33 @@ def train_stage(
     logger.info("=" * 70)
 
     # Load previous checkpoint if warm-starting
+    prev_log_alpha = None
+    prev_alpha_optim_state = None
+    prev_actor_optim_state = None
+    prev_critic_optim_state = None
+
     if prev_checkpoint and prev_checkpoint.exists():
         logger.info("Warm-starting from %s", prev_checkpoint.name)
         checkpoint = torch.load(prev_checkpoint, map_location=device, weights_only=False)
         actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
         critic.load_state_dict(checkpoint["critic_state_dict"], strict=False)
         logger.info("  Loaded actor + critic weights (strict=False for new layers)")
+
+        # ── FIX #1: Restore log_alpha from previous stage ──
+        if "log_alpha" in checkpoint:
+            prev_log_alpha = checkpoint["log_alpha"]
+            logger.info("  Restored log_alpha = %.4f (alpha=%.4f)",
+                        prev_log_alpha, np.exp(prev_log_alpha))
+        else:
+            logger.warning("  log_alpha NOT FOUND in checkpoint — will init fresh")
+
+        # Restore optimizer states if available (same LR → direct load)
+        if "alpha_optim" in checkpoint:
+            prev_alpha_optim_state = checkpoint["alpha_optim"]
+        if "actor_optim" in checkpoint:
+            prev_actor_optim_state = checkpoint["actor_optim"]
+        if "critic_optim" in checkpoint:
+            prev_critic_optim_state = checkpoint["critic_optim"]
 
     # Apply freeze/unfreeze
     logger.info("Applying freeze config...")
@@ -371,10 +392,40 @@ def train_stage(
     actor_optim = torch.optim.Adam(actor_params, lr=stage.learning_rate)
     critic_optim = torch.optim.Adam(critic_params, lr=stage.learning_rate)
 
+    # ── FIX #1 (cont): Restore optimizer states ──
+    # NOTE: Only restore if param count matches (freeze config may change params)
+    if prev_actor_optim_state is not None:
+        try:
+            actor_optim.load_state_dict(prev_actor_optim_state)
+            logger.info("  Restored actor optimizer state")
+        except (ValueError, KeyError):
+            logger.warning("  Could not restore actor optimizer (param mismatch). Starting fresh.")
+    if prev_critic_optim_state is not None:
+        try:
+            critic_optim.load_state_dict(prev_critic_optim_state)
+            logger.info("  Restored critic optimizer state")
+        except (ValueError, KeyError):
+            logger.warning("  Could not restore critic optimizer (param mismatch). Starting fresh.")
+
     # Entropy coefficient (auto-tuned)
-    target_entropy = -4.0  # -action_dim
-    log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    target_entropy = -5.0  # -action_dim (5-dim: confidence, entry_type, risk, sl, tp)
+    if prev_log_alpha is not None:
+        log_alpha = torch.tensor([prev_log_alpha], requires_grad=True, device=device)
+        logger.info("  log_alpha warm-started at %.4f (alpha=%.4f)",
+                    prev_log_alpha, np.exp(prev_log_alpha))
+    else:
+        # Default: start with LOW alpha (conservative exploration)
+        init_log_alpha = -2.0  # alpha = exp(-2) = 0.135
+        log_alpha = torch.tensor([init_log_alpha], requires_grad=True, device=device)
+        logger.info("  log_alpha initialized at %.4f (alpha=%.4f)",
+                    init_log_alpha, np.exp(init_log_alpha))
     alpha_optim = torch.optim.Adam([log_alpha], lr=stage.alpha_lr)
+    if prev_alpha_optim_state is not None:
+        try:
+            alpha_optim.load_state_dict(prev_alpha_optim_state)
+            logger.info("  Restored alpha optimizer state")
+        except (ValueError, KeyError):
+            logger.warning("  Could not restore alpha optimizer. Starting fresh.")
 
     # EpisodicMemory (if enabled)
     memory = None
@@ -395,21 +446,100 @@ def train_stage(
     stage_dir.mkdir(exist_ok=True)
 
     # ── Training loop ──
-    # NOTE: This is a simplified loop structure. In production, this
-    # integrates with VectorizedEnv + ReplayBuffer (from training_pipeline/).
-    # Here we demonstrate the freeze/unfreeze + warm-start + checkpoint logic.
+    # Uses real environment rollouts from data/ directory.
+    # Each step: sample random symbol → get observation from env → actor decides → env steps.
+
+    symbols = ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
+    all_data = load_data(symbols, DATA_DIR / "normalizer_v3.json")
+
+    # Import environment
+    import yaml as _yaml
+    _config_path = project_root / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml"
+    with open(_config_path, "r", encoding="utf-8") as _f:
+        env_config = _yaml.safe_load(_f)
+
+    from environments.prop_env import MultiTFTradingEnv
+
+    # Create env pool (one per symbol)
+    envs = {}
+    for sym in symbols:
+        sym_data = all_data["data"][sym]
+        if sym_data.get("M5") is not None:
+            envs[sym] = MultiTFTradingEnv(
+                data_m1=sym_data.get("M1", np.zeros((1000, 50), dtype=np.float32)),
+                data_m5=sym_data["M5"],
+                data_m15=sym_data.get("M15", np.zeros((500, 50), dtype=np.float32)),
+                data_h1=sym_data.get("H1", np.zeros((200, 50), dtype=np.float32)),
+                config=env_config,
+                n_features=50,
+                initial_balance=10_000.0,
+                episode_length=2000,
+            )
+    active_symbols = list(envs.keys())
+    logger.info("Created %d real environments: %s", len(envs), active_symbols)
+
+    # Initialize environments
+    current_obs = {}
+    for sym in active_symbols:
+        obs, _ = envs[sym].reset(seed=42)
+        current_obs[sym] = obs
 
     logger.info("Starting training loop (%d steps)...", stage.total_steps)
     start_time = time.time()
 
     for step in range(1, stage.total_steps + 1):
-        # Forward pass with dummy data (placeholder — real training uses env rollouts)
-        inputs = create_dummy_input(stage, device, batch=stage.batch_size)
+        # ── Collect experience from REAL environment ──
+        # Cycle through symbols round-robin
+        sym = active_symbols[step % len(active_symbols)]
+        obs = current_obs[sym]
 
-        # Actor forward
+        # Build input tensors from real observation
+        m1_t = torch.from_numpy(obs["m1"]).unsqueeze(0).to(device)
+        m5_t = torch.from_numpy(obs["m5"]).unsqueeze(0).to(device)
+        m15_t = torch.from_numpy(obs["m15"]).unsqueeze(0).to(device)
+        h1_t = torch.from_numpy(obs["h1"]).unsqueeze(0).to(device)
+
+        # Zero out unused TFs per stage config
+        if not stage.use_m1:
+            m1_t = torch.zeros_like(m1_t)
+        if not stage.use_m5:
+            m5_t = torch.zeros_like(m5_t)
+        if not stage.use_m15:
+            m15_t = torch.zeros_like(m15_t)
+        if not stage.use_h1:
+            h1_t = torch.zeros_like(h1_t)
+
+        # Repeat to fill batch
+        m1_batch = m1_t.expand(stage.batch_size, -1, -1)
+        m5_batch = m5_t.expand(stage.batch_size, -1, -1)
+        m15_batch = m15_t.expand(stage.batch_size, -1, -1)
+        h1_batch = h1_t.expand(stage.batch_size, -1, -1)
+
+        inputs = {"m1": m1_batch, "m5": m5_batch, "m15": m15_batch, "h1": h1_batch}
+
+        # Actor forward (stochastic for exploration)
         action, log_prob = actor(
             inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
         )
+
+        # Step environment with first action
+        action_np = action[0].detach().cpu().numpy()
+        env_action = np.array([
+            float(np.clip(action_np[0], -1.0, 1.0)),       # confidence
+            float(np.clip(action_np[1], -1.0, 1.0)),       # entry_type (<0=M5, >0=M1)
+            float(np.clip((action_np[2] + 1) / 2, 0.0, 1.0)),  # risk_frac
+            float(np.clip(action_np[3] * 1.25 + 1.75, 0.5, 3.0)),  # sl_mult
+            float(np.clip(action_np[4] * 2.25 + 2.75, 0.5, 5.0)),  # tp_mult
+        ], dtype=np.float32)
+
+        next_obs, reward, terminated, truncated, info = envs[sym].step(env_action)
+        if terminated or truncated:
+            next_obs, _ = envs[sym].reset()
+        current_obs[sym] = next_obs
+
+        # Build target Q from real reward
+        reward_t = torch.tensor([[reward]], dtype=torch.float32, device=device)
+        reward_batch = reward_t.expand(stage.batch_size, -1)
 
         # Critic forward
         q1, q2 = critic(
@@ -417,12 +547,12 @@ def train_stage(
             action.detach(),
         )
 
-        # SAC losses (simplified — real impl uses replay buffer)
+        # SAC losses with REAL reward signal
         alpha = log_alpha.exp().detach()
 
-        # Critic loss: reward + gamma * V_target - Q(s,a)
-        # (Using dummy targets for structure validation)
-        target_q = torch.randn(stage.batch_size, 1, device=device)
+        # Critic loss: use real reward as target (simplified TD(0))
+        # target_q = reward + gamma * V_next (simplified: just reward for now)
+        target_q = reward_batch
         critic_loss = nn.functional.mse_loss(q1, target_q) + nn.functional.mse_loss(q2, target_q)
 
         critic_optim.zero_grad()
@@ -468,8 +598,8 @@ def train_stage(
 
         # ── Checkpoint ──
         if step % stage.checkpoint_every == 0:
-            ckpt_path = stage_dir / f"checkpoint_{step}.pt"
-            torch.save({
+            # ── FIX #1: Full state checkpoint (includes log_alpha + optimizers) ──
+            full_ckpt = {
                 "stage": stage.name,
                 "step": step,
                 "actor_state_dict": actor.state_dict(),
@@ -477,16 +607,17 @@ def train_stage(
                 "actor_optim": actor_optim.state_dict(),
                 "critic_optim": critic_optim.state_dict(),
                 "log_alpha": log_alpha.detach().cpu().item(),
-            }, ckpt_path)
-            logger.info("  Saved checkpoint → %s", ckpt_path.name)
+                "alpha_optim": alpha_optim.state_dict(),
+            }
 
-            # Save as best (in real training, compare eval reward)
-            torch.save({
-                "stage": stage.name,
-                "step": step,
-                "actor_state_dict": actor.state_dict(),
-                "critic_state_dict": critic.state_dict(),
-            }, best_checkpoint_path)
+            ckpt_path = stage_dir / f"checkpoint_{step}.pt"
+            torch.save(full_ckpt, ckpt_path)
+            logger.info("  Saved checkpoint -> %s (alpha=%.4f)",
+                        ckpt_path.name, log_alpha.exp().item())
+
+            # Save as best — ALSO includes log_alpha + optimizers!
+            torch.save(full_ckpt, best_checkpoint_path)
+            logger.info("  Updated best -> %s", best_checkpoint_path.name)
 
     # ── Save EpisodicMemory ──
     if memory is not None:
@@ -540,7 +671,7 @@ def main() -> None:
 
     actor = SACTransformerActor(
         n_features=50,
-        action_dim=4,
+        action_dim=5,
         embed_dim=128,
         n_heads=4,
         n_cross_layers=1,
@@ -551,7 +682,7 @@ def main() -> None:
 
     critic = SACTransformerCritic(
         n_features=50,
-        action_dim=4,
+        action_dim=5,
         embed_dim=128,
         n_heads=4,
         n_cross_layers=1,

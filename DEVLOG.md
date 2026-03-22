@@ -4,6 +4,56 @@
 
 ---
 
+## 22/03/2026
+
+### [FIX] Phase 3.1 — Đại Phẫu: Dual Entry System + Root Cause Surgery — 22/03/2026 17:35
+- **Branch:** `phase3.1/dual-entry-system`
+- **Nguyên nhân:** Phase 3 (1M steps) thất bại do **Mean Collapse** — bot không vào lệnh.
+  - Root cause: `log_alpha` reset về 1.0 mỗi khi chuyển Stage (không save trong checkpoint)
+  - Stage 1 train trên Dummy Data → policy saturation (confidence = +1.0 100% thời gian)
+  - Stage 2 overcorrect → policy mean collapse xuống 0.065 (dưới threshold 0.3)
+
+**6 file đã sửa:**
+
+#### NV1: Vá Mất trí nhớ + Cấm Dummy Data (`train_curriculum.py`)
+- `log_alpha` + 3 optimizer states (`actor_optim`, `critic_optim`, `alpha_optim`) → save trong TẤT CẢ checkpoint
+- Warm-start khôi phục đầy đủ từ checkpoint trước
+- Default init `log_alpha = -2.0` (alpha=0.135) thay vì 0 (alpha=1.0)
+- **Xóa sạch** dummy data loop → thay bằng **real MultiTFTradingEnv rollouts** từ `data/`
+- `target_entropy`: -4 → **-5** (cho 5-dim action)
+- `action_dim`: 4 → **5**
+
+#### NV2: Dual Entry System — Sếp Vũ chỉ đạo: M1 = Sniper, M5 = Bộ binh
+- **`sac_policy.py`**: Action space **4→5 dim**: `[confidence, entry_type, risk_frac, sl_mult, tp_mult]`
+  - `entry_type < 0` = M5 Normal, `entry_type > 0` = M1 Sniper
+  - Constants: `M5_NORMAL_THRESHOLD = 0.50`, `M1_SNIPER_THRESHOLD = 0.85`
+- **`prop_env.py`**: Action space Box 5-dim, dual threshold gating
+  - `|conf| ≥ 0.85 AND entry_type > 0` → M1 Sniper Entry
+  - `|conf| ≥ 0.50 AND entry_type ≤ 0` → M5 Normal Entry
+  - Else → Standby
+- **`prop_rules.yaml`**: Thêm `m5_normal_threshold: 0.50`, `m1_sniper_threshold: 0.85`
+
+#### NV3: Kỷ luật Thép (`reward_engine.py`)
+- Reward 8→**11 components**:
+  - (C9) **FOMO Oracle**: -5 penalty khi standby mà giá chạy ≥0.5% trong 50 bars (TRAINING ONLY)
+  - (C10) **Sniper Miss**: 3x loss penalty cho Sniper M1 thua
+  - (C11) **Sniper Win**: 5x bonus cho Sniper M1 thắng
+- `inaction_nudge`: -0.01 → **-0.5** (ép bot vào lệnh)
+- `confidence_threshold`: 0.3 → **0.15** (fallback)
+
+#### NV4: Script Phẫu thuật Não (NEW `scripts/extract_encoder.py`)
+- Đọc `best_Stage2_Precision.pt` → giữ 97 encoder layers, re-init 43 policy layers
+- Output: `pretrained_eyes_only.pt` (12.47 MB)
+- Cũng có `scripts/evaluate_model.py` (NEW) cho đánh giá checkpoint
+
+#### Verification:
+- **100-step test**: EXIT CODE 0 ✅
+- Params: 1,440,398 (tăng 514 so với 4-dim — đúng)
+- Alpha: 0.1353 → 0.1314 (ổn định, không explode)
+- 5 env × 4 TF loaded real data, checkpoint 36.2MB full state
+
+---
+
 ## 20/03/2026
 
 ### [COGNITIVE] Phase 3: Data Pipeline & Curriculum Training — 20/03/2026 11:52

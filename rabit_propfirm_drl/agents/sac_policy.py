@@ -1,51 +1,22 @@
-"""
-SAC Policy with Hierarchical Cross-Attention — The "Brain" of the AI Trader.
+"""SAC Policy with Hierarchical Cross-Attention -- The "Brain" of the AI Trader.
 
-v2.0 — Cognitive Architecture Integration:
-    - 4-TF inputs: M1, M5, M15, H1 (no more H4)
+v3.0 -- Dual Entry System (M1 Sniper + M5 Normal):
+    - 4-TF inputs: M1, M5, M15, H1
     - 50-dim feature vector per TF (28 raw + 22 knowledge)
-    - HierarchicalCrossAttentionMTF: Entry (M1×M5) + Structure (M15×H1)
+    - HierarchicalCrossAttentionMTF: Entry (M1xM5) + Structure (M15xH1)
     - EpisodicMemory: auxiliary confidence modifier (OUTSIDE gradient graph)
 
-Architecture Overview:
-    ┌────────────────────────────────────────────────────────────────────┐
-    │                   Hierarchical Feature Extractor                   │
-    │                                                                    │
-    │  M1 (128, 50) ──┐                                                 │
-    │                  ├─ HierarchicalCrossAttentionMTF ──┐              │
-    │  M5 (64, 50)  ──┘   Entry: M1(Q)×M5(KV)            │              │
-    │                                                      │              │
-    │  M15 (48, 50) ──┐                                   │              │
-    │                  ├─ Structure: M15(Q)×H1(KV) ───────┤              │
-    │  H1 (24, 50)  ──┘                                   │              │
-    │                                                      ▼              │
-    │  Outputs: m1_latent(128) + entry_latent(128) +                    │
-    │           structure_latent(128)                                     │
-    │                                                                    │
-    │  m1_latent ──► RegimeDetector ──► regime_emb(128) + probs(4)     │
-    │                                                                    │
-    │  global_state = cat[m1, entry, structure, regime_emb, probs]      │
-    │              = (128 + 128 + 128 + 128 + 4) = 516                  │
-    └────────────────────────────────────────────────────────────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    ▼                       ▼
-            ┌──────────────┐       ┌──────────────┐
-            │    Actor     │       │  Twin Critic  │
-            │  MLP Head    │       │  Q1, Q2 Heads │
-            │ → (μ, log σ) │       │ → Q(s,a)      │
-            │ → tanh(N)    │       │ min(Q1,Q2)    │
-            │ → action[4]  │       │               │
-            └──────┬───────┘       └──────────────┘
-                   │
-                   ▼
-            ┌──────────────┐
-            │ Action Gating│  ← EpisodicMemory bonus (NO gradient!)
-            │ confidence ×  │     query(knowledge_vec) → ±0.3
-            │ (1 + bonus)  │
-            └──────────────┘
+    Action space: 5-dim continuous [-1, 1]^5
+        [0] confidence   : trade conviction (-1=strong SELL, +1=strong BUY)
+        [1] entry_type   : <0 = M5 Normal Entry, >0 = M1 Sniper Entry
+        [2] risk_frac     : position sizing fraction
+        [3] sl_mult       : stop-loss ATR multiplier
+        [4] tp_mult       : take-profit ATR multiplier
 
-    Action space: [confidence, risk_frac, sl_mult, tp_mult] ∈ [-1, 1]^4
+    Dual Entry Gating:
+        M5 Normal:  |confidence| >= 0.50 AND entry_type < 0
+        M1 Sniper:  |confidence| >= 0.85 AND entry_type > 0
+        Standby:    otherwise (no trade)
 
 All parameters configurable. Zero hardcoding.
 """
@@ -63,6 +34,10 @@ from models.regime_detector import RegimeDetector
 LOG_SIG_MAX = 2
 LOG_SIG_MIN = -20
 EPS = 1e-6
+
+# Dual Entry thresholds (used during inference/gating, NOT in loss)
+M5_NORMAL_THRESHOLD = 0.50
+M1_SNIPER_THRESHOLD = 0.85
 
 
 class HierarchicalFeatureExtractor(nn.Module):
@@ -178,7 +153,7 @@ class SACTransformerActor(nn.Module):
     def __init__(
         self,
         n_features: int = 50,
-        action_dim: int = 4,
+        action_dim: int = 5,
         embed_dim: int = 128,
         n_heads: int = 4,
         n_cross_layers: int = 1,
@@ -233,7 +208,7 @@ class SACTransformerActor(nn.Module):
             deterministic: If True, return mean action (no sampling)
 
         Returns:
-            (action, log_prob) — action: (batch, 4), log_prob: (batch, 1)
+            (action, log_prob) -- action: (batch, 5), log_prob: (batch, 1)
         """
         # Extract features through Hierarchical pipeline
         global_state = self.feature_extractor(m1, m5, m15, h1)  # (B, 516)
@@ -288,7 +263,7 @@ class SACTransformerCritic(nn.Module):
     def __init__(
         self,
         n_features: int = 50,
-        action_dim: int = 4,
+        action_dim: int = 5,
         embed_dim: int = 128,
         n_heads: int = 4,
         n_cross_layers: int = 1,

@@ -1,17 +1,20 @@
 """
-Reward Engine — Multi-component reward function for DRL trading agent.
+Reward Engine -- Multi-component reward function for DRL trading agent.
 
-8 Components:
-1. realized_pnl         — Actual profit/loss when closing a trade
-2. unrealized_shaping   — Mark-to-market shaping (delta per step)
-3. dd_penalty           — Exponential drawdown penalty
-4. overnight_penalty    — Penalty for holding past session end
-5. spread_commission    — Execution cost deduction
-6. rr_bonus             — Bonus for good risk/reward ratio
-7. overtrading_penalty  — Penalty for excessive trades per day
-8. inaction_nudge       — Gentle nudge if idle too long
+11 Components:
+ 1. realized_pnl         -- Actual profit/loss when closing a trade
+ 2. unrealized_shaping   -- Mark-to-market shaping (delta per step)
+ 3. dd_penalty           -- Exponential drawdown penalty
+ 4. overnight_penalty    -- Penalty for holding past session end
+ 5. spread_commission    -- Execution cost deduction
+ 6. rr_bonus             -- Bonus for good risk/reward ratio
+ 7. overtrading_penalty  -- Penalty for excessive trades per day
+ 8. inaction_nudge       -- Strong penalty if idle too long (-0.5/step)
+ 9. fomo_penalty         -- PENALTY for missing obvious M1 setups (oracle)
+10. sniper_multiplier    -- 3x loss penalty for failed Sniper (M1) entries
+11. sniper_bonus         -- 5x win bonus for successful Sniper (M1) entries
 
-All weights/thresholds from prop_rules.yaml — zero hardcoding.
+All weights/thresholds from prop_rules.yaml -- zero hardcoding.
 """
 
 from __future__ import annotations
@@ -37,6 +40,9 @@ class RewardBreakdown:
     rr_bonus: float = 0.0
     overtrading_penalty: float = 0.0
     inaction_nudge: float = 0.0
+    fomo_penalty: float = 0.0
+    sniper_multiplier: float = 0.0
+    sniper_bonus: float = 0.0
 
     @property
     def total(self) -> float:
@@ -49,6 +55,9 @@ class RewardBreakdown:
             + self.rr_bonus
             + self.overtrading_penalty
             + self.inaction_nudge
+            + self.fomo_penalty
+            + self.sniper_multiplier
+            + self.sniper_bonus
         )
 
     def to_dict(self) -> dict[str, float]:
@@ -61,6 +70,9 @@ class RewardBreakdown:
             "rr_bonus": self.rr_bonus,
             "overtrading_penalty": self.overtrading_penalty,
             "inaction_nudge": self.inaction_nudge,
+            "fomo_penalty": self.fomo_penalty,
+            "sniper_multiplier": self.sniper_multiplier,
+            "sniper_bonus": self.sniper_bonus,
             "total": self.total,
         }
 
@@ -99,6 +111,15 @@ class RewardEngine:
         # Trading hours
         self.trading_end_utc = config.get("trading_end_utc", 21)
 
+        # Dual Entry System -- Asymmetric Reward
+        self.sniper_win_mult = config.get("sniper_win_multiplier", 5.0)
+        self.sniper_loss_mult = config.get("sniper_loss_multiplier", 3.0)
+
+        # FOMO Oracle (training only)
+        self.fomo_pen = config.get("fomo_penalty", -5.0)
+        self.fomo_lookahead = config.get("fomo_lookahead_steps", 50)
+        self.fomo_move_pct = config.get("fomo_move_threshold_pct", 0.005)
+
     def calculate(
         self,
         realized_pnl: float = 0.0,
@@ -115,75 +136,102 @@ class RewardEngine:
         account_balance: float = 10000.0,
         trade_just_opened: bool = False,
         trade_just_closed: bool = False,
+        # Dual Entry System params
+        entry_type: str = "standby",  # "standby", "m5_normal", "m1_sniper"
+        trade_won: bool = False,
+        future_price_data: Optional[np.ndarray] = None,  # Oracle lookahead
+        current_price: float = 0.0,
     ) -> RewardBreakdown:
         """
-        Calculate all 8 reward components.
+        Calculate all 11 reward components.
 
         Args:
-            realized_pnl: PnL from trade just closed (0 if no close this step)
-            unrealized_pnl: Current mark-to-market of open positions
-            prev_unrealized_pnl: Mark-to-market from previous step
-            current_dd: Current drawdown as decimal (0.03 = 3%)
-            hour_utc: Current hour in UTC
-            has_open_positions: Whether any positions are open
-            spread_cost: Spread cost paid this step (when opening trade)
-            commission: Commission paid this step
-            risk_reward_ratio: R/R ratio of closed trade (0 if no close)
-            trades_today: Number of trades opened today
-            steps_since_last_trade: Steps since last trade action
-            account_balance: Current account balance for normalization
-            trade_just_opened: Whether a trade was opened this step
-            trade_just_closed: Whether a trade was closed this step
+            ... (standard args) ...
+            entry_type: "standby", "m5_normal", or "m1_sniper"
+            trade_won: Whether the closed trade was profitable
+            future_price_data: Next N bars of price data (TRAINING ONLY oracle)
+            current_price: Current close price for FOMO calculation
 
         Returns:
-            RewardBreakdown with all 8 components
+            RewardBreakdown with all 11 components
         """
         breakdown = RewardBreakdown()
 
         # Normalize by balance to make reward scale-invariant
         balance_norm = max(account_balance, 1.0)
 
-        # ─── Component 1: Realized PnL ───
+        # --- Component 1: Realized PnL (with Asymmetric Sniper Multiplier) ---
         if trade_just_closed and realized_pnl != 0:
-            breakdown.realized_pnl = realized_pnl / balance_norm * 100  # As percentage
+            base_pnl = realized_pnl / balance_norm * 100  # As percentage
 
-        # ─── Component 2: Unrealized PnL Shaping ───
-        # Delta-based: reward the CHANGE in unrealized PnL (not absolute)
-        # This prevents gaming by just holding profitable positions
+            if entry_type == "m1_sniper":
+                if trade_won:
+                    # Component 11: Sniper WIN bonus (5x)
+                    breakdown.realized_pnl = base_pnl
+                    breakdown.sniper_bonus = base_pnl * (self.sniper_win_mult - 1.0)
+                else:
+                    # Component 10: Sniper LOSS penalty (3x)
+                    breakdown.realized_pnl = base_pnl
+                    breakdown.sniper_multiplier = base_pnl * (self.sniper_loss_mult - 1.0)
+            else:
+                # M5 Normal: standard 1x reward
+                breakdown.realized_pnl = base_pnl
+
+        # --- Component 2: Unrealized PnL Shaping ---
         delta_unrealized = unrealized_pnl - prev_unrealized_pnl
         breakdown.unrealized_shaping = (
             self.unrealized_weight * delta_unrealized / balance_norm * 100
         )
 
-        # ─── Component 3: Exponential Drawdown Penalty ───
+        # --- Component 3: Exponential Drawdown Penalty ---
         if current_dd > self.dd_start:
-            # Penalty grows exponentially as DD approaches limit
             dd_ratio = current_dd / self.max_daily_dd
             breakdown.dd_penalty = -self.dd_alpha * math.exp(
                 self.dd_beta * dd_ratio
             )
 
-        # ─── Component 4: Overnight Penalty ───
+        # --- Component 4: Overnight Penalty ---
         if has_open_positions and hour_utc >= self.trading_end_utc:
             breakdown.overnight_penalty = self.overnight_pen
 
-        # ─── Component 5: Spread & Commission Cost ───
+        # --- Component 5: Spread & Commission Cost ---
         if trade_just_opened:
             total_cost = spread_cost + commission
             breakdown.spread_commission = -total_cost / balance_norm * 100
 
-        # ─── Component 6: Risk/Reward Bonus ───
+        # --- Component 6: Risk/Reward Bonus ---
         if trade_just_closed and risk_reward_ratio > self.rr_threshold:
             breakdown.rr_bonus = self.rr_coeff * (risk_reward_ratio - 1.0)
 
-        # ─── Component 7: Overtrading Penalty ───
+        # --- Component 7: Overtrading Penalty ---
         if trades_today > self.max_trades_per_day:
             excess = trades_today - self.max_trades_per_day
             breakdown.overtrading_penalty = self.overtrading_pen * excess
 
-        # ─── Component 8: Inaction Nudge ───
+        # --- Component 8: Inaction Nudge ("Bleeding" penalty) ---
         if steps_since_last_trade > self.inaction_threshold and not has_open_positions:
             breakdown.inaction_nudge = self.inaction_pen
+
+        # --- Component 9: FOMO Oracle Penalty (TRAINING ONLY) ---
+        # If agent chose Standby but price moved significantly,
+        # penalize for missing the opportunity.
+        if (
+            entry_type == "standby"
+            and not has_open_positions
+            and future_price_data is not None
+            and len(future_price_data) >= 5
+            and current_price > 0
+        ):
+            # Check if price moved > threshold in next N bars
+            future_max = float(np.max(future_price_data))
+            future_min = float(np.min(future_price_data))
+            max_move_up = (future_max - current_price) / current_price
+            max_move_down = (current_price - future_min) / current_price
+            max_move = max(max_move_up, max_move_down)
+
+            if max_move > self.fomo_move_pct:
+                # Agent missed an obvious setup -> FOMO penalty
+                breakdown.fomo_penalty = self.fomo_pen
 
         return breakdown
 

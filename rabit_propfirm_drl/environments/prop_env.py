@@ -150,7 +150,9 @@ class MultiTFTradingEnv(gym.Env):
         self.max_total_dd = config.get("max_total_drawdown", 0.10)
         self.max_lots = config.get("max_lots_per_trade", 10.0)
         self.max_positions = config.get("max_open_positions", 5)
-        self.confidence_threshold = config.get("confidence_threshold", 0.3)
+        self.confidence_threshold = config.get("confidence_threshold", 0.15)
+        self.m5_threshold = config.get("m5_normal_threshold", 0.50)
+        self.m1_threshold = config.get("m1_sniper_threshold", 0.85)
         self.trading_start = config.get("trading_start_utc", 1)
         self.trading_end = config.get("trading_end_utc", 22)  # Intraday close by 22:00
 
@@ -183,8 +185,8 @@ class MultiTFTradingEnv(gym.Env):
         })
 
         self.action_space = spaces.Box(
-            low=np.array([-1.0, 0.0, 0.5, 0.5], dtype=np.float32),
-            high=np.array([1.0, 1.0, 3.0, 5.0], dtype=np.float32),
+            low=np.array([-1.0, -1.0, 0.0, 0.5, 0.5], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 3.0, 5.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -255,11 +257,20 @@ class MultiTFTradingEnv(gym.Env):
         price = self._get_current_price()
         hour_utc = self._get_simulated_hour()
 
-        # Parse action
+        # Parse action (5-dim: confidence, entry_type, risk_frac, sl_mult, tp_mult)
         confidence = float(np.clip(action[0], -1.0, 1.0))
-        risk_fraction = float(np.clip(action[1], 0.0, 1.0))
-        sl_mult = float(np.clip(action[2], 0.5, 3.0))
-        tp_mult = float(np.clip(action[3], 0.5, 5.0))
+        entry_type_raw = float(np.clip(action[1], -1.0, 1.0))  # <0 = M5, >0 = M1
+        risk_fraction = float(np.clip(action[2], 0.0, 1.0))
+        sl_mult = float(np.clip(action[3], 0.5, 3.0))
+        tp_mult = float(np.clip(action[4], 0.5, 5.0))
+
+        # Determine entry type with DUAL THRESHOLDS
+        entry_type_str = "standby"  # Default: no trade
+        abs_conf = abs(confidence)
+        if entry_type_raw > 0 and abs_conf >= self.m1_threshold:
+            entry_type_str = "m1_sniper"
+        elif entry_type_raw <= 0 and abs_conf >= self.m5_threshold:
+            entry_type_str = "m5_normal"
 
         # ─── Check existing positions (SL/TP hits) ───
         realized_pnl = 0.0
@@ -313,7 +324,7 @@ class MultiTFTradingEnv(gym.Env):
         spread_cost = 0.0
         lot_size = 0.0
 
-        if abs(confidence) >= self.confidence_threshold:
+        if entry_type_str in ("m5_normal", "m1_sniper"):
             direction = 1 if confidence > 0 else -1
 
             # Check: can we open a new position?
@@ -322,7 +333,7 @@ class MultiTFTradingEnv(gym.Env):
                 and self.trading_start <= hour_utc < self.trading_end
             ):
                 # Calculate lot size
-                scaled_confidence = (abs(confidence) - self.confidence_threshold) / (
+                scaled_confidence = (abs_conf - self.confidence_threshold) / (
                     1.0 - self.confidence_threshold
                 )
                 lot_size = risk_fraction * self.max_lots * scaled_confidence
