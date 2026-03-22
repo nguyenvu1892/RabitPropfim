@@ -4,6 +4,18 @@
 
 ---
 
+## 23/03/2026
+
+### [FEAT] AsyncVectorEnv — Parallel Environment Stepping — 23/03/2026 02:10
+- **Trước:** Sequential loop, 1 env/step, fake batch `.expand()`, GPU chờ CPU → **~0.5 SPS**
+- **Sau:** `gymnasium.vector.AsyncVectorEnv` — N envs song song trên N CPU cores
+  - Real diverse batch: N observations khác nhau mỗi step (không repeat!)
+  - Action scaling vectorized via numpy broadcasting
+  - Auto-reset khi episode kết thúc
+- **Config:** Stage 1/2/3: **n_envs=16**, TestStage: **n_envs=4**
+- **Test Local (4 envs, CPU):** 100 steps / 31.5s → **3 SPS** (~6x faster) ✅
+- **RunPod (16 envs, GPU):** Dự kiến **20-50 SPS**
+
 ## 22/03/2026
 
 ### [HOTFIX] Alpha Reset Bug — Mandatory Final Checkpoint Save — 22/03/2026 22:10

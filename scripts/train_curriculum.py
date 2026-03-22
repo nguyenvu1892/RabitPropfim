@@ -114,7 +114,7 @@ STAGES: list[StageConfig] = [
         total_steps=200_000,
         learning_rate=1e-4,    # Reduced from 3e-4 (5-dim action needs softer LR)
         batch_size=256,
-        n_envs=8,
+        n_envs=16,
         use_m1=False, use_m5=False, use_m15=True, use_h1=True,
         freeze_m1_encoder=True, freeze_m5_encoder=True,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -130,7 +130,7 @@ STAGES: list[StageConfig] = [
         total_steps=300_000,
         learning_rate=1e-4,
         batch_size=256,
-        n_envs=8,
+        n_envs=16,
         use_m1=False, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=True, freeze_m5_encoder=False,
         freeze_m15_encoder=True, freeze_h1_encoder=True,   # Freeze from Stage 1
@@ -146,7 +146,7 @@ STAGES: list[StageConfig] = [
         total_steps=500_000,
         learning_rate=5e-5,
         batch_size=256,
-        n_envs=8,
+        n_envs=16,
         use_m1=True, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=False, freeze_m5_encoder=False,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -167,7 +167,7 @@ TEST_STAGES: list[StageConfig] = [
         total_steps=100,
         learning_rate=3e-4,
         batch_size=32,
-        n_envs=2,
+        n_envs=4,
         use_m1=True, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=False, freeze_m5_encoder=False,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -446,8 +446,8 @@ def train_stage(
     stage_dir.mkdir(exist_ok=True)
 
     # ── Training loop ──
-    # Uses real environment rollouts from data/ directory.
-    # Each step: sample random symbol → get observation from env → actor decides → env steps.
+    # Uses AsyncVectorEnv for PARALLEL environment stepping.
+    # N envs run simultaneously across CPU cores → real diverse batch each step.
 
     symbols = ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
     all_data = load_data(symbols, DATA_DIR / "normalizer_v3.json")
@@ -460,12 +460,15 @@ def train_stage(
 
     from environments.prop_env import MultiTFTradingEnv
 
-    # Create env pool (one per symbol)
-    envs = {}
-    for sym in symbols:
-        sym_data = all_data["data"][sym]
-        if sym_data.get("M5") is not None:
-            envs[sym] = MultiTFTradingEnv(
+    # ── AsyncVectorEnv: N parallel envs across CPU cores ──
+    import gymnasium
+    n_envs = stage.n_envs  # 16 default, up to 32
+
+    def make_env(sym: str, seed: int):
+        """Factory function for AsyncVectorEnv."""
+        def _init():
+            sym_data = all_data["data"][sym]
+            env = MultiTFTradingEnv(
                 data_m1=sym_data.get("M1", np.zeros((1000, 50), dtype=np.float32)),
                 data_m5=sym_data["M5"],
                 data_m15=sym_data.get("M15", np.zeros((500, 50), dtype=np.float32)),
@@ -475,29 +478,31 @@ def train_stage(
                 initial_balance=10_000.0,
                 episode_length=2000,
             )
-    active_symbols = list(envs.keys())
-    logger.info("Created %d real environments: %s", len(envs), active_symbols)
+            env.reset(seed=seed)
+            return env
+        return _init
 
-    # Initialize environments
-    current_obs = {}
-    for sym in active_symbols:
-        obs, _ = envs[sym].reset(seed=42)
-        current_obs[sym] = obs
+    # Distribute symbols round-robin across N envs
+    env_fns = []
+    for i in range(n_envs):
+        sym = symbols[i % len(symbols)]
+        env_fns.append(make_env(sym, seed=42 + i))
+
+    vec_env = gymnasium.vector.AsyncVectorEnv(env_fns)
+    obs_batch, _ = vec_env.reset()
+    logger.info("Created AsyncVectorEnv with %d parallel envs (symbols: %s)",
+                n_envs, [symbols[i % len(symbols)] for i in range(n_envs)])
 
     logger.info("Starting training loop (%d steps)...", stage.total_steps)
     start_time = time.time()
 
     for step in range(1, stage.total_steps + 1):
-        # ── Collect experience from REAL environment ──
-        # Cycle through symbols round-robin
-        sym = active_symbols[step % len(active_symbols)]
-        obs = current_obs[sym]
-
-        # Build input tensors from real observation
-        m1_t = torch.from_numpy(obs["m1"]).unsqueeze(0).to(device)
-        m5_t = torch.from_numpy(obs["m5"]).unsqueeze(0).to(device)
-        m15_t = torch.from_numpy(obs["m15"]).unsqueeze(0).to(device)
-        h1_t = torch.from_numpy(obs["h1"]).unsqueeze(0).to(device)
+        # ── Build input tensors from REAL parallel observations ──
+        # obs_batch["m1"] is (N, 128, 50), obs_batch["m5"] is (N, 64, 50), etc.
+        m1_t = torch.from_numpy(obs_batch["m1"]).to(device, dtype=torch.float32)
+        m5_t = torch.from_numpy(obs_batch["m5"]).to(device, dtype=torch.float32)
+        m15_t = torch.from_numpy(obs_batch["m15"]).to(device, dtype=torch.float32)
+        h1_t = torch.from_numpy(obs_batch["h1"]).to(device, dtype=torch.float32)
 
         # ── NaN/Inf guard on input tensors ──
         m1_t = torch.nan_to_num(m1_t, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -515,37 +520,31 @@ def train_stage(
         if not stage.use_h1:
             h1_t = torch.zeros_like(h1_t)
 
-        # Repeat to fill batch
-        m1_batch = m1_t.expand(stage.batch_size, -1, -1)
-        m5_batch = m5_t.expand(stage.batch_size, -1, -1)
-        m15_batch = m15_t.expand(stage.batch_size, -1, -1)
-        h1_batch = h1_t.expand(stage.batch_size, -1, -1)
+        inputs = {"m1": m1_t, "m5": m5_t, "m15": m15_t, "h1": h1_t}
 
-        inputs = {"m1": m1_batch, "m5": m5_batch, "m15": m15_batch, "h1": h1_batch}
-
-        # Actor forward (stochastic for exploration)
+        # Actor forward — REAL batch of N diverse observations
         action, log_prob = actor(
             inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
         )
 
-        # Step environment with first action
-        action_np = action[0].detach().cpu().numpy()
-        env_action = np.array([
-            float(np.clip(action_np[0], -1.0, 1.0)),       # confidence
-            float(np.clip(action_np[1], -1.0, 1.0)),       # entry_type (<0=M5, >0=M1)
-            float(np.clip((action_np[2] + 1) / 2, 0.0, 1.0)),  # risk_frac
-            float(np.clip(action_np[3] * 1.25 + 1.75, 0.5, 3.0)),  # sl_mult
-            float(np.clip(action_np[4] * 2.25 + 2.75, 0.5, 5.0)),  # tp_mult
-        ], dtype=np.float32)
+        # Scale actions for ALL N envs at once (vectorized numpy)
+        actions_np = action.detach().cpu().numpy()  # (N, 5)
+        env_actions = np.stack([
+            np.clip(actions_np[:, 0], -1.0, 1.0),                        # confidence
+            np.clip(actions_np[:, 1], -1.0, 1.0),                        # entry_type
+            np.clip((actions_np[:, 2] + 1) / 2, 0.0, 1.0),              # risk_frac
+            np.clip(actions_np[:, 3] * 1.25 + 1.75, 0.5, 3.0),          # sl_mult
+            np.clip(actions_np[:, 4] * 2.25 + 2.75, 0.5, 5.0),          # tp_mult
+        ], axis=-1).astype(np.float32)  # (N, 5)
 
-        next_obs, reward, terminated, truncated, info = envs[sym].step(env_action)
-        if terminated or truncated:
-            next_obs, _ = envs[sym].reset()
-        current_obs[sym] = next_obs
+        # ── Step ALL envs in parallel (AsyncVectorEnv handles subprocesses) ──
+        next_obs_batch, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
 
-        # Build target Q from real reward
-        reward_t = torch.tensor([[reward]], dtype=torch.float32, device=device)
-        reward_batch = reward_t.expand(stage.batch_size, -1)
+        # Auto-reset is handled by AsyncVectorEnv (autoreset=True by default)
+        obs_batch = next_obs_batch
+
+        # Build reward tensor — REAL diverse rewards from N envs
+        reward_batch = torch.from_numpy(rewards).unsqueeze(-1).to(device, dtype=torch.float32)  # (N, 1)
 
         # Critic forward
         q1, q2 = critic(
@@ -666,6 +665,9 @@ def train_stage(
                 best_checkpoint_path.name,
                 log_alpha.detach().cpu().item(),
                 log_alpha.exp().item())
+
+    # ── Cleanup parallel envs ──
+    vec_env.close()
 
     # ── Save EpisodicMemory ──
     if memory is not None:
