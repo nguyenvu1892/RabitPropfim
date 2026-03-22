@@ -6,6 +6,14 @@
 
 ## 22/03/2026
 
+### [HOTFIX] Alpha Reset Bug — Mandatory Final Checkpoint Save — 22/03/2026 22:10
+- **Branch:** `phase3.1/dual-entry-system` → **merge vào `main`**
+- **Bug:** `log_alpha` reset về 1.0 khi chuyển Stage (RunPod đang chạy code cũ chưa merge)
+- **Fix:** Thêm MANDATORY final checkpoint save sau khi training loop kết thúc
+  - Đảm bảo `log_alpha` + optimizer states LUÔN LUÔN được lưu ở bước cuối cùng
+  - Log xác nhận: `FINAL checkpoint -> best_TestStage.pt (log_alpha=-2.0300, alpha=0.1313)`
+- **Test:** 100 steps, EXIT CODE 0 ✅
+
 ### [FIX] Phase 3.1 — Đại Phẫu: Dual Entry System + Root Cause Surgery — 22/03/2026 17:35
 - **Branch:** `phase3.1/dual-entry-system`
 - **Nguyên nhân:** Phase 3 (1M steps) thất bại do **Mean Collapse** — bot không vào lệnh.

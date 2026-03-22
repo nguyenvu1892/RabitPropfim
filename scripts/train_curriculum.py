@@ -619,6 +619,25 @@ def train_stage(
             torch.save(full_ckpt, best_checkpoint_path)
             logger.info("  Updated best -> %s", best_checkpoint_path.name)
 
+    # ── MANDATORY final checkpoint at stage end ──
+    # Ensures log_alpha + optimizers are ALWAYS saved, even if last step
+    # didn't align with checkpoint_every. This prevents alpha reset!
+    final_ckpt = {
+        "stage": stage.name,
+        "step": stage.total_steps,
+        "actor_state_dict": actor.state_dict(),
+        "critic_state_dict": critic.state_dict(),
+        "actor_optim": actor_optim.state_dict(),
+        "critic_optim": critic_optim.state_dict(),
+        "log_alpha": log_alpha.detach().cpu().item(),
+        "alpha_optim": alpha_optim.state_dict(),
+    }
+    torch.save(final_ckpt, best_checkpoint_path)
+    logger.info("  FINAL checkpoint -> %s (log_alpha=%.4f, alpha=%.4f)",
+                best_checkpoint_path.name,
+                log_alpha.detach().cpu().item(),
+                log_alpha.exp().item())
+
     # ── Save EpisodicMemory ──
     if memory is not None:
         memory.save(MODELS_DIR / "episodic_memory.json")
