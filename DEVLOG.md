@@ -24,6 +24,15 @@
 - **Data verified:** 20 files × 50-dim → **0 NaN, 0 Inf** (data sạch, lỗi do gradient)
 - **Test:** 100 steps, EXIT CODE 0 ✅
 
+### [HOTFIX] math.exp Overflow + Gradient Explosion — 22/03/2026 01:50
+- **Bug:** `OverflowError: math range error` at `reward_engine.py:189` — `math.exp(dd_beta * dd_ratio)` overflows when DD ratio is extreme
+- **Thêm:** NaN guard bắt 60+ steps liên tục → critic weights bị NaN → recovery loop nhưng vẫn crash ở reward
+- **Fix 3 chỗ:**
+  1. `reward_engine.py`: Clamp exponent trong `math.exp()` vào [-50, 50] → chặn Overflow
+  2. `train_curriculum.py`: Stage 1 LR: **3e-4 → 1e-4** (giảm tốc cho 5-dim action + frozen layers)
+  3. `train_curriculum.py`: `grad_clip`: **1.0 → 0.5** (siết đạo hàm gắt hơn)
+- **Test:** 100 steps, **0 NaN warnings, 0 overflow**, EXIT CODE 0 ✅
+
 ### [FIX] Phase 3.1 — Đại Phẫu: Dual Entry System + Root Cause Surgery — 22/03/2026 17:35
 - **Branch:** `phase3.1/dual-entry-system`
 - **Nguyên nhân:** Phase 3 (1M steps) thất bại do **Mean Collapse** — bot không vào lệnh.

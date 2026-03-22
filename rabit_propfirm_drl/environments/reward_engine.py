@@ -186,9 +186,9 @@ class RewardEngine:
         # --- Component 3: Exponential Drawdown Penalty ---
         if current_dd > self.dd_start:
             dd_ratio = current_dd / self.max_daily_dd
-            breakdown.dd_penalty = -self.dd_alpha * math.exp(
-                self.dd_beta * dd_ratio
-            )
+            # Clamp exponent to prevent OverflowError (math range error)
+            exp_arg = max(-50.0, min(self.dd_beta * dd_ratio, 50.0))
+            breakdown.dd_penalty = -self.dd_alpha * math.exp(exp_arg)
 
         # --- Component 4: Overnight Penalty ---
         if has_open_positions and hour_utc >= self.trading_end_utc:

@@ -103,7 +103,7 @@ class StageConfig:
     gamma: float = 0.99       # Discount factor
     tau: float = 0.005        # Soft update coefficient
     alpha_lr: float = 3e-4    # Entropy coefficient LR
-    grad_clip: float = 1.0    # Gradient clipping norm
+    grad_clip: float = 0.5    # Gradient clipping norm (tighter for 5-dim action)
     description: str = ""
 
 
@@ -112,7 +112,7 @@ STAGES: list[StageConfig] = [
         name="Stage1_Context",
         description="Context Recognition: M15+H1 only, learn trend/regime identification",
         total_steps=200_000,
-        learning_rate=3e-4,
+        learning_rate=1e-4,    # Reduced from 3e-4 (5-dim action needs softer LR)
         batch_size=256,
         n_envs=8,
         use_m1=False, use_m5=False, use_m15=True, use_h1=True,
