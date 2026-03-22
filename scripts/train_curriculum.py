@@ -499,6 +499,12 @@ def train_stage(
         m15_t = torch.from_numpy(obs["m15"]).unsqueeze(0).to(device)
         h1_t = torch.from_numpy(obs["h1"]).unsqueeze(0).to(device)
 
+        # ── NaN/Inf guard on input tensors ──
+        m1_t = torch.nan_to_num(m1_t, nan=0.0, posinf=5.0, neginf=-5.0)
+        m5_t = torch.nan_to_num(m5_t, nan=0.0, posinf=5.0, neginf=-5.0)
+        m15_t = torch.nan_to_num(m15_t, nan=0.0, posinf=5.0, neginf=-5.0)
+        h1_t = torch.nan_to_num(h1_t, nan=0.0, posinf=5.0, neginf=-5.0)
+
         # Zero out unused TFs per stage config
         if not stage.use_m1:
             m1_t = torch.zeros_like(m1_t)
@@ -561,6 +567,18 @@ def train_stage(
             nn.utils.clip_grad_norm_(critic_params, stage.grad_clip)
         critic_optim.step()
 
+        # ── NaN guard: check critic weights after update ──
+        critic_nan = any(torch.isnan(p).any() for p in critic_params if p.grad is not None)
+        if critic_nan:
+            logger.error("  ⚠ NaN detected in critic weights at step %d! Skipping this step.", step)
+            # Reload from last checkpoint to recover
+            last_ckpt = best_checkpoint_path
+            if last_ckpt.exists():
+                ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+                critic.load_state_dict(ckpt["critic_state_dict"])
+                logger.info("  Recovered critic from %s", last_ckpt.name)
+            continue
+
         # Actor loss: -Q(s, a_new) + alpha * log_prob
         action_new, log_prob_new = actor(
             inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
@@ -577,6 +595,17 @@ def train_stage(
         if stage.grad_clip > 0:
             nn.utils.clip_grad_norm_(actor_params, stage.grad_clip)
         actor_optim.step()
+
+        # ── NaN guard: check actor weights after update ──
+        actor_nan = any(torch.isnan(p).any() for p in actor_params if p.grad is not None)
+        if actor_nan:
+            logger.error("  ⚠ NaN detected in actor weights at step %d! Skipping this step.", step)
+            last_ckpt = best_checkpoint_path
+            if last_ckpt.exists():
+                ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
+                actor.load_state_dict(ckpt["actor_state_dict"])
+                logger.info("  Recovered actor from %s", last_ckpt.name)
+            continue
 
         # Alpha loss (entropy tuning)
         alpha_loss = -(log_alpha * (log_prob_new.detach() + target_entropy)).mean()

@@ -220,6 +220,12 @@ class SACTransformerActor(nn.Module):
         log_std = torch.clamp(log_std, LOG_SIG_MIN, LOG_SIG_MAX)
         std = log_std.exp()
 
+        # ── NaN/Inf guard: prevent crash in Normal() ──
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=5.0, neginf=-5.0)
+        mean = torch.clamp(mean, -5.0, 5.0)
+        std = torch.nan_to_num(std, nan=0.1, posinf=1.0, neginf=0.01)
+        std = torch.clamp(std, min=1e-6)
+
         # Squashed Gaussian sampling
         normal = Normal(mean, std)
 

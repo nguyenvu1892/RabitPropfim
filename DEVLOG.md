@@ -14,6 +14,16 @@
   - Log xác nhận: `FINAL checkpoint -> best_TestStage.pt (log_alpha=-2.0300, alpha=0.1313)`
 - **Test:** 100 steps, EXIT CODE 0 ✅
 
+### [HOTFIX] NaN Crash in Actor Forward (ValueError: Normal) — 22/03/2026 22:45
+- **Bug:** Actor mean tensor all-NaN at Step 2 → `ValueError: Expected parameter loc... Real()` crash
+- **Root cause:** Gradient explosion after Step 1 update corrupts weights → `mean_head` outputs NaN
+- **Fix 3 lớp:**
+  1. `train_curriculum.py`: `nan_to_num()` trên 4 input tensors (M1/M5/M15/H1), clamp ±5.0
+  2. `train_curriculum.py`: NaN check sau mỗi `optimizer.step()` → auto-recover từ checkpoint
+  3. `sac_policy.py`: `nan_to_num + clamp` trên `mean/std` trước `Normal()` constructor
+- **Data verified:** 20 files × 50-dim → **0 NaN, 0 Inf** (data sạch, lỗi do gradient)
+- **Test:** 100 steps, EXIT CODE 0 ✅
+
 ### [FIX] Phase 3.1 — Đại Phẫu: Dual Entry System + Root Cause Surgery — 22/03/2026 17:35
 - **Branch:** `phase3.1/dual-entry-system`
 - **Nguyên nhân:** Phase 3 (1M steps) thất bại do **Mean Collapse** — bot không vào lệnh.
