@@ -700,7 +700,7 @@ def main() -> None:
 
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         logger.info("GPU: %s (%.1f GB)", gpu_name, gpu_mem)
 
     # Select stages
