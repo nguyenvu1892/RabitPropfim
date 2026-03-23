@@ -302,6 +302,13 @@ def main() -> None:
             size_mb = full_features.nbytes / (1024 * 1024)
             print(f"  {sym} {tf_name}: ({full_features.shape[0]:,} × {full_features.shape[1]}) → {save_path.name} ({size_mb:.1f}MB)")
 
+            # V3: Also save raw OHLCV for env price calculations
+            # Trim OHLCV to match feature array length
+            ohlcv_trimmed = ohlcv_np[-len(full_features):]
+            ohlcv_path = DATA_DIR / f"{safe_name}_{tf_name}_ohlcv.npy"
+            np.save(ohlcv_path, ohlcv_trimmed)
+            print(f"    + OHLCV: ({ohlcv_trimmed.shape[0]:,} × {ohlcv_trimmed.shape[1]}) → {ohlcv_path.name}")
+
         gc.collect()  # Free memory after each symbol
 
     # ── Step 5: Save normalizer_v3.json ──

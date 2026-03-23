@@ -99,6 +99,7 @@ class MultiTFTradingEnv(gym.Env):
         commission_per_lot: float = 7.0,
         close_idx: int = 4,
         render_mode: str | None = None,
+        ohlcv_m5: np.ndarray | None = None,
     ) -> None:
         """
         Args:
@@ -113,8 +114,11 @@ class MultiTFTradingEnv(gym.Env):
             pip_value:  Price value of 1 pip
             lot_value:  Contract size per lot
             commission_per_lot: Round-trip commission per lot
-            close_idx:  Column index of close price in feature arrays
+            close_idx:  Column index of close price in feature arrays (DEPRECATED)
             render_mode: Gymnasium render mode
+            ohlcv_m5:  (N_m5, 5) — Raw OHLCV array [open,high,low,close,volume]
+                       Used for REAL price/ATR calculations. If None, synthetic
+                       prices are reconstructed from log_return (col 27).
         """
         super().__init__()
 
@@ -125,8 +129,36 @@ class MultiTFTradingEnv(gym.Env):
         self.data_h1 = data_h1.astype(np.float32)
 
         self.n_features = n_features
-        self.close_idx = close_idx
+        self.close_idx = close_idx  # DEPRECATED — use ohlcv_m5 instead
         self.render_mode = render_mode
+
+        # ─── V3: Real OHLCV for price calculations ───
+        if ohlcv_m5 is not None:
+            self.ohlcv_m5 = ohlcv_m5.astype(np.float32)
+            self._use_real_ohlcv = True
+            logger.info("V3: Using REAL OHLCV prices (shape=%s)", self.ohlcv_m5.shape)
+        else:
+            # Fallback: reconstruct synthetic prices from log_return (col 27)
+            self._use_real_ohlcv = False
+            log_ret_col = 27  # log_return column index in 50-dim features
+            log_returns = data_m5[:, log_ret_col].astype(np.float64)
+            # Reconstruct synthetic close prices from cumulative log returns
+            # Start from a reference price of 1000.0 (arbitrary but stable)
+            cum_log_ret = np.cumsum(np.nan_to_num(log_returns, nan=0.0))
+            # Clamp to prevent float overflow (range: ~37 → exp(37) ≈ 1e16)
+            cum_log_ret = np.clip(cum_log_ret, -20.0, 20.0)
+            synthetic_close = 1000.0 * np.exp(cum_log_ret)
+            # Replace any inf/nan with 1000.0
+            synthetic_close = np.nan_to_num(synthetic_close, nan=1000.0, posinf=1e8, neginf=100.0)
+            # Build synthetic OHLCV (close-only, H/L approximated)
+            self.ohlcv_m5 = np.column_stack([
+                synthetic_close,                     # open ≈ close
+                synthetic_close * 1.001,             # high
+                synthetic_close * 0.999,             # low
+                synthetic_close,                     # close
+                np.ones(len(synthetic_close)),        # volume (dummy)
+            ]).astype(np.float32)
+            logger.warning("V3: No OHLCV provided — using SYNTHETIC prices from log_return")
 
         # Time alignment ratios (how many M1 bars per M5 bar, etc.)
         # M1:M5 = 5:1, M5:M15 = 3:1, M15:H1 = 4:1
@@ -499,9 +531,19 @@ class MultiTFTradingEnv(gym.Env):
     # ─────────────────────────────────────────
 
     def _get_current_price(self) -> float:
-        """Get current close price from M5 data."""
-        idx = min(self.current_m5_step, self.n_m5_bars - 1)
-        return float(self.data_m5[idx, self.close_idx])
+        """Get current close price from real OHLCV (V3 fix)."""
+        idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
+        return float(self.ohlcv_m5[idx, 3])  # Column 3 = close
+
+    def _get_current_high(self) -> float:
+        """Get current high price from OHLCV."""
+        idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
+        return float(self.ohlcv_m5[idx, 1])  # Column 1 = high
+
+    def _get_current_low(self) -> float:
+        """Get current low price from OHLCV."""
+        idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
+        return float(self.ohlcv_m5[idx, 2])  # Column 2 = low
 
     def _get_simulated_hour(self) -> int:
         """Simulate hour of day from M5 step index (M5 = 5 min bars)."""
@@ -509,16 +551,28 @@ class MultiTFTradingEnv(gym.Env):
         return minutes // 60
 
     def _estimate_atr_pips(self, price: float) -> float:
-        """Estimate ATR in pips from recent M5 price moves."""
+        """Estimate ATR in pips from REAL OHLCV high/low/close (V3 fix).
+
+        Uses True Range: max(H-L, |H-Cprev|, |L-Cprev|)
+        """
         lookback = min(14, self.current_m5_step - self.start_m5_step)
         if lookback < 2:
-            return 20.0  # Default 20 pips
+            # Default ATR based on price scale
+            return max(price * 0.001 / self.pip_value, 5.0)
 
         start = max(0, self.current_m5_step - lookback)
         end = self.current_m5_step + 1
-        prices = self.data_m5[start:end, self.close_idx]
-        returns = np.abs(np.diff(prices))
-        atr = float(np.mean(returns))
+        ohlcv_window = self.ohlcv_m5[start:end]
+        highs = ohlcv_window[:, 1]
+        lows = ohlcv_window[:, 2]
+        closes = ohlcv_window[:, 3]
+
+        # True Range calculation
+        tr1 = highs[1:] - lows[1:]                    # H - L
+        tr2 = np.abs(highs[1:] - closes[:-1])          # |H - Cprev|
+        tr3 = np.abs(lows[1:] - closes[:-1])            # |L - Cprev|
+        true_range = np.maximum(np.maximum(tr1, tr2), tr3)
+        atr = float(np.mean(true_range))
         atr_pips = atr / self.pip_value
 
         return max(atr_pips, 5.0)

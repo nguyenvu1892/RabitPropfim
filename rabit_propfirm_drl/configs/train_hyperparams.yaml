@@ -1,96 +1,96 @@
+# ═══════════════════════════════════════════════════════════════
+# V3 — GPU-Optimized Hyperparameters (RTX 4090 24GB VRAM)
+# ═══════════════════════════════════════════════════════════════
+# Target: GPU-Util ≥ 85%, VRAM ≥ 80% usage
+
 # ═══ SAC Algorithm Config ═══
-algo: sac                       # Algorithm: sac | ppo | td3
-learning_rate: 3.0e-4           # Actor/Critic learning rate
-batch_size: 256                 # Mini-batch size for updates
-gamma: 0.99                     # Discount factor
-tau: 0.005                      # Soft update coefficient for target networks
-alpha_lr: 3.0e-4                # Temperature (entropy) learning rate
-target_entropy: auto            # auto = -dim(action_space)
+algo: sac
+learning_rate: 1.0e-4           # Conservative for 5-dim action
+batch_size: 2048                # V3: from 256 → 2048 (fill 4090 VRAM)
+gamma: 0.99
+tau: 0.005
+alpha_lr: 3.0e-4
+target_entropy: -2.0            # V3: from -5.0 → -2.0 (anti mode collapse)
+
+# ═══ Rollout Collection ═══
+n_envs: 32                      # V3: from 16 → 32 (max CPU cores on RunPod)
+n_steps: 4096                   # V3: NEW — rollout steps before update
+n_updates_per_rollout: 8        # V3: NEW — gradient steps per rollout
+                                # Total data per rollout = n_envs × n_steps = 32 × 4096 = 131K
+                                # Each update uses batch_size=2048 sampled from buffer
 
 # ═══ Replay Buffer ═══
-buffer_size: 1_000_000          # Total capacity of replay buffer
-per_alpha: 0.6                  # PER priority exponent (0 = uniform, 1 = full priority)
-per_beta_start: 0.4             # PER importance sampling start (anneals to 1.0)
-per_beta_frames: 500_000        # Steps to anneal beta from start to 1.0
+buffer_size: 500_000            # V3: reduced from 1M (RAM efficient on RunPod)
+per_alpha: 0.6
+per_beta_start: 0.4
+per_beta_frames: 500_000
 
 # ═══ Network Architecture ═══
-transformer_embed_dim: 128      # Transformer embedding dimension
-transformer_n_heads: 4          # Number of attention heads
-transformer_n_layers: 2         # Number of transformer encoder layers
-transformer_dropout: 0.1        # Dropout rate in transformer
-transformer_lookback: 96        # Lookback window for M15 (96 bars = 24h)
-context_lookback_h4: 30         # H4 context lookback (30 bars = 5 days)
-context_lookback_h1: 48         # H1 context lookback (48 bars = 2 days)
+transformer_embed_dim: 128
+transformer_n_heads: 4
+transformer_n_layers: 2
+transformer_dropout: 0.1
 
-actor_hidden_dims: [256, 256]   # Actor MLP hidden layer sizes
-critic_hidden_dims: [256, 256]  # Critic MLP hidden layer sizes
+actor_hidden_dims: [256, 256]
+critic_hidden_dims: [256, 256]
 
 # ═══ Regime Detector ═══
-regime_n_states: 4              # Number of HMM regimes (trend-up, trend-down, range, volatile)
+regime_n_states: 4
 
-# ═══ Ensemble ═══
-n_ensemble_models: 3            # Number of models in ensemble
-ensemble_consensus: 0.67        # Minimum vote fraction to act (2/3)
-ensemble_random_seeds: [42, 123, 789]  # Seeds for reproducibility
-
-# ═══ Curriculum Learning ═══
-curriculum_stages: 4
+# ═══ Curriculum V3 Stages ═══
+# GPU-optimized: larger envs + batches per stage
+curriculum_stages: 3
 curriculum_stage_configs:
   stage_1:
-    name: "kindergarten"
-    max_steps: 50_000
-    spread_mode: fixed
-    slippage_enabled: false
-    commission_enabled: false
-    data_filter: trending_only
-    max_dd_override: 0.20       # Relaxed DD limit
-    promote_reward_threshold: 0.5
+    name: "Stage1_Context"
+    description: "Context Recognition: M15+H1 only"
+    total_steps: 200_000
+    learning_rate: 1.0e-4
+    batch_size: 2048
+    n_envs: 32
+    n_steps: 4096
+    episode_length: 2000
   stage_2:
-    name: "elementary"
-    max_steps: 200_000
-    spread_mode: variable
-    slippage_enabled: true
-    commission_enabled: false
-    data_filter: trending_and_ranging
-    max_dd_override: 0.15
-    promote_reward_threshold: 0.3
+    name: "Stage2_Precision"
+    description: "Precision Entry: Add M5"
+    total_steps: 300_000
+    learning_rate: 1.0e-4
+    batch_size: 2048
+    n_envs: 32
+    n_steps: 4096
+    episode_length: 2000
   stage_3:
-    name: "highschool"
-    max_steps: 500_000
-    spread_mode: variable
-    slippage_enabled: true
-    commission_enabled: true
-    data_filter: all_regimes
-    max_dd_override: 0.10       # Prop Firm actual
-    promote_reward_threshold: 0.2
-  stage_4:
-    name: "university"
-    max_steps: -1               # Train until convergence
-    spread_mode: variable
-    slippage_enabled: true
-    commission_enabled: true
-    data_filter: all_regimes_with_events
-    max_dd_override: null       # Use prop_rules.yaml values
-    promote_reward_threshold: null
+    name: "Stage3_FullFusion"
+    description: "Full Integration: All 4 TFs"
+    total_steps: 500_000
+    learning_rate: 5.0e-5
+    batch_size: 4096              # Stage 3: push to 4096 (all TFs active)
+    n_envs: 32
+    n_steps: 8192                 # Longer rollout for full context
+    episode_length: 2000
 
 # ═══ Training ═══
-total_timesteps: 2_000_000      # Total training steps (across all stages)
-eval_frequency: 10_000          # Evaluate every N steps
-checkpoint_frequency: 50_000    # Save model every N steps
-n_eval_episodes: 20             # Episodes per evaluation
-warmup_steps: 10_000            # Random actions before training starts
-gradient_clip_norm: 1.0         # Max gradient norm
+total_timesteps: 1_000_000
+eval_frequency: 10_000
+checkpoint_frequency: 50_000
+n_eval_episodes: 20
+warmup_steps: 10_000
+gradient_clip_norm: 0.5           # V3: tighter clip for stability
 
-# ═══ Nightly Safe Retrain ═══
-retrain_lr: 1.0e-5              # 10x lower than initial LR
-retrain_max_epochs: 5           # Conservative fine-tuning
-retrain_new_data_ratio: 0.2     # 20% new data, 80% historical
-retrain_gradient_clip: 0.5      # Tighter gradient clipping
-retrain_validation_days: 30     # Backtest on last N days
-retrain_sharpe_tolerance: 0.9   # Deploy if new_sharpe >= old * 0.9
-retrain_dd_tolerance: 1.1       # Deploy if new_dd <= old * 1.1
+# ═══ GPU Memory Guide ═══
+# RTX 4090 (24GB VRAM) allocation estimate:
+#   Model (Actor+Critic):     ~50 MB
+#   Batch 2048 × 4TF:         ~400 MB  (m1=128×50, m5=64×50, m15=48×50, h1=24×50)
+#   Batch 4096 × 4TF:         ~800 MB
+#   Replay buffer (GPU):      ~2 GB (if on GPU, else CPU)
+#   Gradients + optimizer:    ~200 MB
+#   Total peak:               ~3.5 GB → Safe headroom (24GB)
+#
+# If OOM at batch_size=4096:
+#   1. Drop to batch_size=2048
+#   2. Use gradient_accumulation_steps=2
 
 # ═══ W&B Tracking ═══
-wandb_project: "rabit-propfirm-drl"
-wandb_entity: null              # Set to your W&B username/org
-wandb_log_frequency: 100        # Log metrics every N steps
+wandb_project: "rabit-propfirm-v3"
+wandb_entity: null
+wandb_log_frequency: 100

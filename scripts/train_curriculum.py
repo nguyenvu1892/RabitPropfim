@@ -104,6 +104,8 @@ class StageConfig:
     tau: float = 0.005        # Soft update coefficient
     alpha_lr: float = 3e-4    # Entropy coefficient LR
     grad_clip: float = 0.5    # Gradient clipping norm (tighter for 5-dim action)
+    n_steps: int = 4096       # V3: Rollout steps before gradient update
+    n_updates_per_rollout: int = 8  # V3: Gradient updates per collected rollout
     description: str = ""
 
 
@@ -112,9 +114,11 @@ STAGES: list[StageConfig] = [
         name="Stage1_Context",
         description="Context Recognition: M15+H1 only, learn trend/regime identification",
         total_steps=200_000,
-        learning_rate=1e-4,    # Reduced from 3e-4 (5-dim action needs softer LR)
-        batch_size=256,
-        n_envs=16,
+        learning_rate=1e-4,
+        batch_size=2048,           # V3: from 256 → 2048
+        n_envs=32,                 # V3: from 16 → 32 (fill CPU cores)
+        n_steps=4096,              # V3: rollout buffer
+        n_updates_per_rollout=8,   # V3: gradient updates per rollout
         use_m1=False, use_m5=False, use_m15=True, use_h1=True,
         freeze_m1_encoder=True, freeze_m5_encoder=True,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -129,24 +133,28 @@ STAGES: list[StageConfig] = [
         description="Precision Entry: Add M5, learn entry timing at POIs",
         total_steps=300_000,
         learning_rate=1e-4,
-        batch_size=256,
-        n_envs=16,
+        batch_size=2048,           # V3: from 256 → 2048
+        n_envs=32,                 # V3: from 16 → 32
+        n_steps=4096,
+        n_updates_per_rollout=8,
         use_m1=False, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=True, freeze_m5_encoder=False,
-        freeze_m15_encoder=True, freeze_h1_encoder=True,   # Freeze from Stage 1
-        freeze_entry_cross=False, freeze_struct_cross=True,  # Open entry, freeze struct
+        freeze_m15_encoder=True, freeze_h1_encoder=True,
+        freeze_entry_cross=False, freeze_struct_cross=True,
         use_episodic_memory=False,
-        fixed_sl_tp=False,  # Variable SL/TP now
+        fixed_sl_tp=False,
         checkpoint_every=30_000,
         eval_every=15_000,
     ),
     StageConfig(
         name="Stage3_FullFusion",
-        description="Full Integration: All 4 TFs + EpisodicMemory, target WR≥55%",
+        description="Full Integration: All 4 TFs + EpisodicMemory, target WR>=55%",
         total_steps=500_000,
         learning_rate=5e-5,
-        batch_size=256,
-        n_envs=16,
+        batch_size=4096,           # V3: push to 4096 (all TFs active, 4090 eats this)
+        n_envs=32,                 # V3: from 16 → 32
+        n_steps=8192,              # V3: longer rollout for full context
+        n_updates_per_rollout=16,  # V3: more updates from richer data
         use_m1=True, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=False, freeze_m5_encoder=False,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -155,7 +163,7 @@ STAGES: list[StageConfig] = [
         fixed_sl_tp=False,
         checkpoint_every=50_000,
         eval_every=25_000,
-        gamma=0.995,    # Slightly longer horizon for full context
+        gamma=0.995,
     ),
 ]
 
@@ -168,6 +176,8 @@ TEST_STAGES: list[StageConfig] = [
         learning_rate=3e-4,
         batch_size=32,
         n_envs=4,
+        n_steps=32,                # V3: small rollout for test
+        n_updates_per_rollout=2,
         use_m1=True, use_m5=True, use_m15=True, use_h1=True,
         freeze_m1_encoder=False, freeze_m5_encoder=False,
         freeze_m15_encoder=False, freeze_h1_encoder=False,
@@ -264,7 +274,7 @@ def load_data(symbols: list[str], normalizer_path: Path) -> dict:
     for tf_name, state in norm_data.items():
         normalizers[tf_name] = RunningNormalizer.from_state_dict(state)
 
-    # Load feature arrays
+    # Load feature arrays + OHLCV (V3)
     data = {}
     for sym in symbols:
         safe_name = sym.replace(".", "_")
@@ -278,8 +288,18 @@ def load_data(symbols: list[str], normalizer_path: Path) -> dict:
                 data[sym][tf_name] = arr_norm.astype(np.float32)
                 logger.info("  Loaded %s %s: %s", sym, tf_name, arr.shape)
             else:
-                logger.warning("  Missing %s — will use zeros", npy_path.name)
+                logger.warning("  Missing %s -- will use zeros", npy_path.name)
                 data[sym][tf_name] = None
+
+            # V3: Load OHLCV if available
+            ohlcv_path = DATA_DIR / f"{safe_name}_{tf_name}_ohlcv.npy"
+            ohlcv_key = f"{tf_name}_ohlcv"
+            if ohlcv_path.exists():
+                ohlcv = np.load(ohlcv_path).astype(np.float32)
+                data[sym][ohlcv_key] = ohlcv
+                logger.info("  Loaded %s %s OHLCV: %s", sym, tf_name, ohlcv.shape)
+            else:
+                data[sym][ohlcv_key] = None
 
     return {"data": data, "normalizers": normalizers}
 
@@ -407,8 +427,8 @@ def train_stage(
         except (ValueError, KeyError):
             logger.warning("  Could not restore critic optimizer (param mismatch). Starting fresh.")
 
-    # Entropy coefficient (auto-tuned)
-    target_entropy = -5.0  # -action_dim (5-dim: confidence, entry_type, risk, sl, tp)
+    # Entropy coefficient (auto-tuned) — V3: raised target for more exploration
+    target_entropy = -2.0  # V3: raised from -5.0 to fight mode collapse
     if prev_log_alpha is not None:
         log_alpha = torch.tensor([prev_log_alpha], requires_grad=True, device=device)
         logger.info("  log_alpha warm-started at %.4f (alpha=%.4f)",
@@ -477,6 +497,7 @@ def train_stage(
                 n_features=50,
                 initial_balance=10_000.0,
                 episode_length=2000,
+                ohlcv_m5=sym_data.get("M5_ohlcv"),  # V3: pass real OHLCV
             )
             env.reset(seed=seed)
             return env
@@ -493,140 +514,190 @@ def train_stage(
     logger.info("Created AsyncVectorEnv with %d parallel envs (symbols: %s)",
                 n_envs, [symbols[i % len(symbols)] for i in range(n_envs)])
 
-    logger.info("Starting training loop (%d steps)...", stage.total_steps)
+    logger.info("Starting training loop (%d steps, n_steps=%d, batch=%d, n_updates=%d)...",
+                stage.total_steps, stage.n_steps, stage.batch_size, stage.n_updates_per_rollout)
     start_time = time.time()
 
-    for step in range(1, stage.total_steps + 1):
-        # ── Build input tensors from REAL parallel observations ──
-        # obs_batch["m1"] is (N, 128, 50), obs_batch["m5"] is (N, 64, 50), etc.
-        m1_t = torch.from_numpy(obs_batch["m1"]).to(device, dtype=torch.float32)
-        m5_t = torch.from_numpy(obs_batch["m5"]).to(device, dtype=torch.float32)
-        m15_t = torch.from_numpy(obs_batch["m15"]).to(device, dtype=torch.float32)
-        h1_t = torch.from_numpy(obs_batch["h1"]).to(device, dtype=torch.float32)
+    # ── V3: Rollout Buffer (stores transitions on CPU, samples to GPU) ──
+    # Buffer stores flattened obs tensors + actions + rewards
+    # This allows mini-batch sampling of batch_size >> n_envs
+    buffer_m1 = []
+    buffer_m5 = []
+    buffer_m15 = []
+    buffer_h1 = []
+    buffer_rewards = []
 
-        # ── NaN/Inf guard on input tensors ──
-        m1_t = torch.nan_to_num(m1_t, nan=0.0, posinf=5.0, neginf=-5.0)
-        m5_t = torch.nan_to_num(m5_t, nan=0.0, posinf=5.0, neginf=-5.0)
-        m15_t = torch.nan_to_num(m15_t, nan=0.0, posinf=5.0, neginf=-5.0)
-        h1_t = torch.nan_to_num(h1_t, nan=0.0, posinf=5.0, neginf=-5.0)
+    global_step = 0
+    rollout_count = 0
 
-        # Zero out unused TFs per stage config
-        if not stage.use_m1:
-            m1_t = torch.zeros_like(m1_t)
-        if not stage.use_m5:
-            m5_t = torch.zeros_like(m5_t)
-        if not stage.use_m15:
-            m15_t = torch.zeros_like(m15_t)
-        if not stage.use_h1:
-            h1_t = torch.zeros_like(h1_t)
+    while global_step < stage.total_steps:
+        # ══════════════════════════════════════════════════
+        # PHASE 1: COLLECT ROLLOUT (CPU-bound, fills n_steps)
+        # ══════════════════════════════════════════════════
+        buffer_m1.clear()
+        buffer_m5.clear()
+        buffer_m15.clear()
+        buffer_h1.clear()
+        buffer_rewards.clear()
 
-        inputs = {"m1": m1_t, "m5": m5_t, "m15": m15_t, "h1": h1_t}
+        collect_steps = min(stage.n_steps, stage.total_steps - global_step)
+        for _c in range(collect_steps):
+            # Build input tensors
+            m1_t = torch.from_numpy(obs_batch["m1"]).to(device, dtype=torch.float32)
+            m5_t = torch.from_numpy(obs_batch["m5"]).to(device, dtype=torch.float32)
+            m15_t = torch.from_numpy(obs_batch["m15"]).to(device, dtype=torch.float32)
+            h1_t = torch.from_numpy(obs_batch["h1"]).to(device, dtype=torch.float32)
 
-        # Actor forward — REAL batch of N diverse observations
-        action, log_prob = actor(
-            inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
-        )
+            # NaN/Inf guard
+            m1_t = torch.nan_to_num(m1_t, nan=0.0, posinf=5.0, neginf=-5.0)
+            m5_t = torch.nan_to_num(m5_t, nan=0.0, posinf=5.0, neginf=-5.0)
+            m15_t = torch.nan_to_num(m15_t, nan=0.0, posinf=5.0, neginf=-5.0)
+            h1_t = torch.nan_to_num(h1_t, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        # Scale actions for ALL N envs at once (vectorized numpy)
-        actions_np = action.detach().cpu().numpy()  # (N, 5)
-        env_actions = np.stack([
-            np.clip(actions_np[:, 0], -1.0, 1.0),                        # confidence
-            np.clip(actions_np[:, 1], -1.0, 1.0),                        # entry_type
-            np.clip((actions_np[:, 2] + 1) / 2, 0.0, 1.0),              # risk_frac
-            np.clip(actions_np[:, 3] * 1.25 + 1.75, 0.5, 3.0),          # sl_mult
-            np.clip(actions_np[:, 4] * 2.25 + 2.75, 0.5, 5.0),          # tp_mult
-        ], axis=-1).astype(np.float32)  # (N, 5)
+            # Zero unused TFs
+            if not stage.use_m1:
+                m1_t = torch.zeros_like(m1_t)
+            if not stage.use_m5:
+                m5_t = torch.zeros_like(m5_t)
+            if not stage.use_m15:
+                m15_t = torch.zeros_like(m15_t)
+            if not stage.use_h1:
+                h1_t = torch.zeros_like(h1_t)
 
-        # ── Step ALL envs in parallel (AsyncVectorEnv handles subprocesses) ──
-        next_obs_batch, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
+            # Actor forward (no grad for collection)
+            with torch.no_grad():
+                action, _ = actor(m1_t, m5_t, m15_t, h1_t)
 
-        # Auto-reset is handled by AsyncVectorEnv (autoreset=True by default)
-        obs_batch = next_obs_batch
+            # Scale actions
+            actions_np = action.cpu().numpy()
+            env_actions = np.stack([
+                np.clip(actions_np[:, 0], -1.0, 1.0),
+                np.clip(actions_np[:, 1], -1.0, 1.0),
+                np.clip((actions_np[:, 2] + 1) / 2, 0.0, 1.0),
+                np.clip(actions_np[:, 3] * 1.25 + 1.75, 0.5, 3.0),
+                np.clip(actions_np[:, 4] * 2.25 + 2.75, 0.5, 5.0),
+            ], axis=-1).astype(np.float32)
 
-        # Build reward tensor — REAL diverse rewards from N envs
-        reward_batch = torch.from_numpy(rewards).unsqueeze(-1).to(device, dtype=torch.float32)  # (N, 1)
+            # Step all envs
+            next_obs_batch, rewards, terminateds, truncateds, infos = vec_env.step(env_actions)
 
-        # Critic forward
-        q1, q2 = critic(
-            inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
-            action.detach(),
-        )
+            # Store in buffer (CPU tensors)
+            buffer_m1.append(m1_t.cpu())
+            buffer_m5.append(m5_t.cpu())
+            buffer_m15.append(m15_t.cpu())
+            buffer_h1.append(h1_t.cpu())
+            buffer_rewards.append(torch.from_numpy(rewards.astype(np.float32)).unsqueeze(-1))
 
-        # SAC losses with REAL reward signal
+            obs_batch = next_obs_batch
+            global_step += 1
+
+        # Stack buffer: (n_steps * n_envs, ...)
+        all_m1 = torch.cat(buffer_m1, dim=0)       # (n_steps*n_envs, 128, 50)
+        all_m5 = torch.cat(buffer_m5, dim=0)
+        all_m15 = torch.cat(buffer_m15, dim=0)
+        all_h1 = torch.cat(buffer_h1, dim=0)
+        all_rewards = torch.cat(buffer_rewards, dim=0)  # (n_steps*n_envs, 1)
+        buffer_size = all_m1.shape[0]
+        rollout_count += 1
+
+        # ══════════════════════════════════════════════════
+        # PHASE 2: GRADIENT UPDATES (GPU-bound, fills GPU)
+        # ══════════════════════════════════════════════════
         alpha = log_alpha.exp().detach()
+        avg_critic_loss = 0.0
+        avg_actor_loss = 0.0
+        avg_entropy = 0.0
 
-        # Critic loss: use real reward as target (simplified TD(0))
-        # target_q = reward + gamma * V_next (simplified: just reward for now)
-        target_q = reward_batch
-        critic_loss = nn.functional.mse_loss(q1, target_q) + nn.functional.mse_loss(q2, target_q)
+        for _u in range(stage.n_updates_per_rollout):
+            # Sample random mini-batch from rollout buffer
+            indices = torch.randint(0, buffer_size, (stage.batch_size,))
+            mb_m1 = all_m1[indices].to(device)
+            mb_m5 = all_m5[indices].to(device)
+            mb_m15 = all_m15[indices].to(device)
+            mb_h1 = all_h1[indices].to(device)
+            mb_rewards = all_rewards[indices].to(device)
 
-        critic_optim.zero_grad()
-        critic_loss.backward()
-        if stage.grad_clip > 0:
-            nn.utils.clip_grad_norm_(critic_params, stage.grad_clip)
-        critic_optim.step()
+            # Forward pass (fresh actions for policy gradient)
+            action_new, log_prob_new = actor(mb_m1, mb_m5, mb_m15, mb_h1)
 
-        # ── NaN guard: check critic weights after update ──
-        critic_nan = any(torch.isnan(p).any() for p in critic_params if p.grad is not None)
-        if critic_nan:
-            logger.error("  ⚠ NaN detected in critic weights at step %d! Skipping this step.", step)
-            # Reload from last checkpoint to recover
-            last_ckpt = best_checkpoint_path
-            if last_ckpt.exists():
-                ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
-                critic.load_state_dict(ckpt["critic_state_dict"])
-                logger.info("  Recovered critic from %s", last_ckpt.name)
-            continue
+            # Critic forward
+            q1, q2 = critic(mb_m1, mb_m5, mb_m15, mb_h1, action_new.detach())
 
-        # Actor loss: -Q(s, a_new) + alpha * log_prob
-        action_new, log_prob_new = actor(
-            inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
-        )
-        q1_new, q2_new = critic(
-            inputs["m1"], inputs["m5"], inputs["m15"], inputs["h1"],
-            action_new,
-        )
-        min_q_new = torch.min(q1_new, q2_new)
-        actor_loss = (alpha * log_prob_new - min_q_new).mean()
+            # Critic loss (TD(0): target = reward)
+            target_q = mb_rewards
+            critic_loss = nn.functional.mse_loss(q1, target_q) + nn.functional.mse_loss(q2, target_q)
 
-        actor_optim.zero_grad()
-        actor_loss.backward()
-        if stage.grad_clip > 0:
-            nn.utils.clip_grad_norm_(actor_params, stage.grad_clip)
-        actor_optim.step()
+            critic_optim.zero_grad()
+            critic_loss.backward()
+            if stage.grad_clip > 0:
+                nn.utils.clip_grad_norm_(critic_params, stage.grad_clip)
+            critic_optim.step()
 
-        # ── NaN guard: check actor weights after update ──
-        actor_nan = any(torch.isnan(p).any() for p in actor_params if p.grad is not None)
-        if actor_nan:
-            logger.error("  ⚠ NaN detected in actor weights at step %d! Skipping this step.", step)
-            last_ckpt = best_checkpoint_path
-            if last_ckpt.exists():
-                ckpt = torch.load(last_ckpt, map_location=device, weights_only=False)
-                actor.load_state_dict(ckpt["actor_state_dict"])
-                logger.info("  Recovered actor from %s", last_ckpt.name)
-            continue
+            # NaN guard on critic
+            critic_nan = any(torch.isnan(p).any() for p in critic_params if p.grad is not None)
+            if critic_nan:
+                logger.error("  NaN in critic at step %d! Recovering...", global_step)
+                if best_checkpoint_path.exists():
+                    ckpt = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
+                    critic.load_state_dict(ckpt["critic_state_dict"])
+                continue
 
-        # Alpha loss (entropy tuning)
-        alpha_loss = -(log_alpha * (log_prob_new.detach() + target_entropy)).mean()
-        alpha_optim.zero_grad()
-        alpha_loss.backward()
-        alpha_optim.step()
+            # Actor loss: -Q(s, a_new) + alpha * log_prob
+            q1_new, q2_new = critic(mb_m1, mb_m5, mb_m15, mb_h1, action_new)
+            min_q_new = torch.min(q1_new, q2_new)
+            actor_loss = (alpha * log_prob_new - min_q_new).mean()
+
+            actor_optim.zero_grad()
+            actor_loss.backward()
+            if stage.grad_clip > 0:
+                nn.utils.clip_grad_norm_(actor_params, stage.grad_clip)
+            actor_optim.step()
+
+            # NaN guard on actor
+            actor_nan = any(torch.isnan(p).any() for p in actor_params if p.grad is not None)
+            if actor_nan:
+                logger.error("  NaN in actor at step %d! Recovering...", global_step)
+                if best_checkpoint_path.exists():
+                    ckpt = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
+                    actor.load_state_dict(ckpt["actor_state_dict"])
+                continue
+
+            # Alpha loss (entropy tuning)
+            alpha_loss = -(log_alpha * (log_prob_new.detach() + target_entropy)).mean()
+            alpha_optim.zero_grad()
+            alpha_loss.backward()
+            alpha_optim.step()
+
+            # V3: Entropy floor
+            with torch.no_grad():
+                log_alpha.clamp_(min=-3.0, max=2.0)
+            alpha = log_alpha.exp().detach()
+
+            avg_critic_loss += critic_loss.item()
+            avg_actor_loss += actor_loss.item()
+            avg_entropy += (-log_prob_new.detach().mean().item())
+
+        # Average over updates
+        n_upd = max(stage.n_updates_per_rollout, 1)
+        avg_critic_loss /= n_upd
+        avg_actor_loss /= n_upd
+        avg_entropy /= n_upd
 
         # ── Logging ──
-        if step % stage.eval_every == 0 or step == 1:
+        step = global_step
+        if rollout_count % max(1, stage.eval_every // stage.n_steps) == 0 or rollout_count == 1:
             elapsed = time.time() - start_time
             sps = step / elapsed if elapsed > 0 else 0
             logger.info(
                 "[%s] Step %d/%d (%.1f%%) | SPS=%.0f | "
-                "critic_loss=%.4f | actor_loss=%.4f | alpha=%.4f",
+                "critic=%.4f | actor=%.4f | alpha=%.4f | entropy=%.3f | buf=%d",
                 stage.name, step, stage.total_steps,
                 100 * step / stage.total_steps, sps,
-                critic_loss.item(), actor_loss.item(), alpha.item(),
+                avg_critic_loss, avg_actor_loss, alpha.item(), avg_entropy, buffer_size,
             )
 
-        # ── Checkpoint ──
-        if step % stage.checkpoint_every == 0:
-            # ── FIX #1: Full state checkpoint (includes log_alpha + optimizers) ──
+        # ── Checkpoint (based on global_step) ──
+        if step >= stage.checkpoint_every and step % stage.checkpoint_every < stage.n_steps:
             full_ckpt = {
                 "stage": stage.name,
                 "step": step,
@@ -643,7 +714,7 @@ def train_stage(
             logger.info("  Saved checkpoint -> %s (alpha=%.4f)",
                         ckpt_path.name, log_alpha.exp().item())
 
-            # Save as best — ALSO includes log_alpha + optimizers!
+            # Save as best
             torch.save(full_ckpt, best_checkpoint_path)
             logger.info("  Updated best -> %s", best_checkpoint_path.name)
 
@@ -686,8 +757,13 @@ def train_stage(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Curriculum Training for Cognitive Architecture")
-    parser.add_argument("--resume-stage", type=int, default=1, help="Stage to resume from (1-3)")
+    parser = argparse.ArgumentParser(description="Curriculum Training V3 -- Stage-Gate Process")
+    parser.add_argument("--stage", type=int, default=None,
+                        help="Train ONLY this stage (1/2/3). HARD STOP after completion.")
+    parser.add_argument("--all", action="store_true",
+                        help="Run ALL stages sequentially (NOT recommended for V3).")
+    parser.add_argument("--resume-stage", type=int, default=1,
+                        help="When using --all, start from this stage.")
     parser.add_argument("--test", action="store_true", help="Quick test run (100 steps)")
     parser.add_argument("--device", type=str, default="auto", help="Device: cuda/cpu/auto")
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
@@ -707,73 +783,93 @@ def main() -> None:
 
     # Select stages
     stages = TEST_STAGES if args.test else STAGES
-    start_stage = max(1, min(args.resume_stage, len(stages)))
+
+    # ── V3: Determine run mode ──
+    single_stage_mode = False
+    target_stage_num = None
+
+    if args.test:
+        pass  # Test runs all test stages
+    elif args.stage is not None:
+        single_stage_mode = True
+        target_stage_num = args.stage
+        if target_stage_num < 1 or target_stage_num > len(stages):
+            logger.error("Invalid --stage %d. Must be 1-%d.", target_stage_num, len(stages))
+            sys.exit(1)
+    elif args.all:
+        logger.warning("Running ALL stages (--all). Stage-Gate review will be skipped!")
+    else:
+        logger.error("=" * 70)
+        logger.error("  V3 STAGE-GATE: You must specify which stage to train!")
+        logger.error("")
+        logger.error("  Usage:")
+        logger.error("    python train_curriculum.py --stage 1   # Train Stage 1 ONLY")
+        logger.error("    python train_curriculum.py --stage 2   # Train Stage 2 (needs Stage 1 .pt)")
+        logger.error("    python train_curriculum.py --stage 3   # Train Stage 3 (needs Stage 2 .pt)")
+        logger.error("    python train_curriculum.py --test      # Quick 100-step test")
+        logger.error("")
+        logger.error("  Workflow: train --stage N -> backtest_behavioral.py -> review -> --stage N+1")
+        logger.error("=" * 70)
+        sys.exit(1)
 
     logger.info("=" * 70)
-    logger.info("  CURRICULUM TRAINING — Cognitive Architecture v1.0")
-    logger.info("  Stages: %d | Starting from: Stage %d", len(stages), start_stage)
-    if args.test:
+    logger.info("  CURRICULUM TRAINING V3")
+    if single_stage_mode:
+        logger.info("  MODE: STAGE-GATE (Stage %d only -> HARD STOP)", target_stage_num)
+    elif args.test:
         logger.info("  MODE: TEST (100 steps)")
+    else:
+        logger.info("  MODE: ALL STAGES (resume from %d)", args.resume_stage)
     logger.info("=" * 70)
 
     # Create models
     from agents.sac_policy import SACTransformerActor, SACTransformerCritic
 
     actor = SACTransformerActor(
-        n_features=50,
-        action_dim=5,
-        embed_dim=128,
-        n_heads=4,
-        n_cross_layers=1,
-        n_regimes=4,
-        hidden_dims=[256, 256],
-        dropout=0.1,
+        n_features=50, action_dim=5, embed_dim=128, n_heads=4,
+        n_cross_layers=1, n_regimes=4, hidden_dims=[256, 256], dropout=0.1,
     ).to(device)
-
     critic = SACTransformerCritic(
-        n_features=50,
-        action_dim=5,
-        embed_dim=128,
-        n_heads=4,
-        n_cross_layers=1,
-        n_regimes=4,
-        hidden_dims=[256, 256],
-        dropout=0.1,
+        n_features=50, action_dim=5, embed_dim=128, n_heads=4,
+        n_cross_layers=1, n_regimes=4, hidden_dims=[256, 256], dropout=0.1,
     ).to(device)
 
-    actor_params = sum(p.numel() for p in actor.parameters())
-    critic_params = sum(p.numel() for p in critic.parameters())
+    actor_p = sum(p.numel() for p in actor.parameters())
+    critic_p = sum(p.numel() for p in critic.parameters())
     logger.info("Actor: %d params | Critic: %d params | Total: %d",
-                actor_params, critic_params, actor_params + critic_params)
+                actor_p, critic_p, actor_p + critic_p)
 
-    # ── Run curriculum ──
+    # ── Build run list ──
+    if single_stage_mode:
+        stages_to_run = [(target_stage_num, stages[target_stage_num - 1])]
+    else:
+        start = max(1, min(args.resume_stage, len(stages)))
+        stages_to_run = [(i + 1, s) for i, s in enumerate(stages) if i + 1 >= start]
+
+    # ── Find previous checkpoint (Stage-Gate validation) ──
     prev_checkpoint = None
-
-    # Check for existing checkpoints to resume
-    if start_stage > 1:
-        prev_stage = stages[start_stage - 2]
+    first_stage_num = stages_to_run[0][0]
+    if first_stage_num > 1:
+        prev_stage = stages[first_stage_num - 2]
         prev_ckpt = MODELS_DIR / f"best_{prev_stage.name}.pt"
         if prev_ckpt.exists():
             prev_checkpoint = prev_ckpt
-            logger.info("Found previous checkpoint: %s", prev_ckpt.name)
+            logger.info("Warm-start from: %s", prev_ckpt.name)
+        else:
+            logger.error("=" * 70)
+            logger.error("  STAGE-GATE VIOLATION!")
+            logger.error("  Cannot start Stage %d without Stage %d checkpoint.",
+                         first_stage_num, first_stage_num - 1)
+            logger.error("  Missing: %s", prev_ckpt)
+            logger.error("  Train and validate Stage %d first!", first_stage_num - 1)
+            logger.error("=" * 70)
+            sys.exit(1)
 
-    for idx, stage in enumerate(stages):
-        stage_num = idx + 1
-        if stage_num < start_stage:
-            logger.info("Skipping Stage %d (%s) — resuming from %d",
-                        stage_num, stage.name, start_stage)
-            # Still try to load its checkpoint for warm-start chain
-            ckpt_path = MODELS_DIR / f"best_{stage.name}.pt"
-            if ckpt_path.exists():
-                prev_checkpoint = ckpt_path
-            continue
-
+    # ── Run stages ──
+    for stage_num, stage in stages_to_run:
         prev_checkpoint = train_stage(
-            stage=stage,
-            actor=actor,
-            critic=critic,
-            device=device,
-            prev_checkpoint=prev_checkpoint,
+            stage=stage, actor=actor, critic=critic,
+            device=device, prev_checkpoint=prev_checkpoint,
             wandb_enabled=not args.no_wandb,
         )
         gc.collect()
@@ -782,12 +878,27 @@ def main() -> None:
 
     # ── Final summary ──
     logger.info("=" * 70)
-    logger.info("  CURRICULUM TRAINING COMPLETE!")
-    logger.info("  Checkpoints saved in: %s", MODELS_DIR)
+    if single_stage_mode:
+        st = stages[target_stage_num - 1]
+        logger.info("  STAGE %d (%s) COMPLETE!", target_stage_num, st.name)
+        logger.info("")
+        logger.info("  >>> HARD STOP -- Do NOT proceed without review! <<<")
+        logger.info("")
+        logger.info("  Next steps:")
+        logger.info("    1. python scripts/backtest_behavioral.py")
+        logger.info("    2. Review behavioral report")
+        if target_stage_num < len(stages):
+            nxt = target_stage_num + 1
+            logger.info("    3. If PASS: python scripts/train_curriculum.py --stage %d", nxt)
+        else:
+            logger.info("    3. If PASS: Deploy to paper trading!")
+        logger.info("    4. If FAIL: Tune hyperparams, re-train --stage %d", target_stage_num)
+    else:
+        logger.info("  CURRICULUM TRAINING COMPLETE!")
+    logger.info("  Checkpoints: %s", MODELS_DIR)
     logger.info("=" * 70)
 
-    checkpoints = sorted(MODELS_DIR.glob("best_*.pt"))
-    for ckpt in checkpoints:
+    for ckpt in sorted(MODELS_DIR.glob("best_*.pt")):
         logger.info("  %s (%.1f MB)", ckpt.name, ckpt.stat().st_size / (1024 * 1024))
 
 

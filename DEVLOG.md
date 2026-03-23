@@ -6,6 +6,52 @@
 
 ## 23/03/2026
 
+### [MAJOR] V3 Core Fixes — Blind Price Bug + GPU Optimization + Stage-Gate — 23/03/2026 23:27
+- **Commit:** `95e4925` on `main` — 9 files changed, +1282 / -1646
+- **Branch:** trực tiếp trên `main`
+
+#### 1. FIX Bug Mù Giá (Priority 1)
+- **Trước:** `prop_env.py` dùng `data_m5[step, close_idx=4]` → col 4 = `pin_bar_bull` ≈ 0, **KHÔNG PHẢI close price**
+- **Sau:** Thêm param `ohlcv_m5` (N×5 OHLCV thực). `_get_current_price()` đọc OHLCV col 3 (close)
+- **ATR:** Viết lại `_estimate_atr_pips()` dùng **True Range** formula: `max(H-L, |H-Cprev|, |L-Cprev|)`
+- **Fallback:** Khi chưa có `_ohlcv.npy`, reconstruct synthetic prices từ `log_return` (col 27) với clamp `[-20, 20]`
+- `fetch_historical_data.py` lưu thêm `_ohlcv.npy` song song `_50dim.npy`
+- **Test:** price = 908.89 (trước: 0.00), ATR = 90 pips (trước: 0), trades = 1 (trước: 0) ✅
+
+#### 2. GPU Optimization — Vắt kiệt RTX 4090
+- **Training loop viết lại hoàn toàn:** 2-phase Rollout Buffer pattern
+  - Phase 1 (CPU): 32 envs × n_steps=4096 → buffer 131K transitions
+  - Phase 2 (GPU): Sample batch_size=2048/4096 → n_updates=8/16 gradient steps
+- **Config nâng cấp:** `n_envs` 16→32, `batch_size` 256→2048/4096, `n_steps` 4096/8192
+- `train_hyperparams.yaml` cập nhật toàn bộ
+- **Test:** entropy=3.4 (trước: 0.0), alpha=0.135 (stable), no NaN ✅
+
+#### 3. Entropy Regularization — Chống Mode Collapse  
+- `target_entropy` nâng từ -5.0 → **-2.0**
+- `log_alpha` kẹp `[-3.0, 2.0]` → alpha ∈ [0.05, 7.39], không thể tụt về 0
+- **Kết quả:** entropy duy trì 3.3-3.5 suốt 100 steps test (V2: 0.00)
+
+#### 4. Stage-Gate Workflow — Ngắt Cầu Dao
+- `train_curriculum.py --stage N` train 1 stage → **HARD STOP**
+- Chạy không arg → in hướng dẫn, exit code 1
+- `--stage 2` khi chưa có Stage1.pt → **STAGE-GATE VIOLATION**, chặn chạy
+- Workflow: `/train-v3` (file `.agents/workflows/train-v3.md`)
+
+#### Files thay đổi:
+| File | Thay đổi |
+|------|----------|
+| `prop_env.py` | +ohlcv_m5, real price, True Range ATR, synthetic fallback |
+| `fetch_historical_data.py` | +save _ohlcv.npy |
+| `train_curriculum.py` | Rollout buffer, GPU config, entropy floor, Stage-Gate |
+| `train_hyperparams.yaml` | GPU-optimized settings |
+| `backtest_behavioral.py` | [NEW] Behavioral analysis script (4 modules) |
+| `v3_smoke_test.py` | [NEW] V3 price/ATR verification |
+| `train-v3.md` | [NEW] Stage-Gate workflow |
+
+---
+
+## 23/03/2026
+
 ### [FEAT] AsyncVectorEnv — Parallel Environment Stepping — 23/03/2026 02:10
 - **Trước:** Sequential loop, 1 env/step, fake batch `.expand()`, GPU chờ CPU → **~0.5 SPS**
 - **Sau:** `gymnasium.vector.AsyncVectorEnv` — N envs song song trên N CPU cores
