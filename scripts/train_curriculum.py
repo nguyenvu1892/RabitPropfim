@@ -297,9 +297,11 @@ def load_data(symbols: list[str], normalizer_path: Path) -> dict:
             if ohlcv_path.exists():
                 ohlcv = np.load(ohlcv_path).astype(np.float32)
                 data[sym][ohlcv_key] = ohlcv
-                logger.info("  Loaded %s %s OHLCV: %s", sym, tf_name, ohlcv.shape)
+                logger.info("  V3 OHLCV: %s -> %s", ohlcv_path.name, ohlcv.shape)
             else:
                 data[sym][ohlcv_key] = None
+                if tf_name == "M5":
+                    logger.warning("  V3 OHLCV MISSING: %s (checked: %s)", ohlcv_path.name, ohlcv_path)
 
     return {"data": data, "normalizers": normalizers}
 
