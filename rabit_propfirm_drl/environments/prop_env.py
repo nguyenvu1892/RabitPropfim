@@ -1,20 +1,13 @@
 """
-PropFirm Trading Environment — Custom Gymnasium environment for DRL training.
+PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-v2.0 — Cognitive Architecture:
-    - Multi-TF observations: dict of {m1, m5, m15, h1} arrays
-    - 4 timeframes: M1 (128 bars), M5 (64 bars), M15 (48 bars), H1 (24 bars)
-    - 50-dim features per bar (28 raw + 22 knowledge)
-    - H4 removed entirely
-    - Session-based trading (intraday close by 22:00)
-
-State: Dict observation space:
-    m1:  (128, 50) — sniper entry
-    m5:  (64, 50)  — normal entry
-    m15: (48, 50)  — structure context
-    h1:  (24, 50)  — trend bias
-
-Action: [confidence, risk_fraction, sl_mult, tp_mult] ∈ continuous
+V3.3 -- "Ruong Vang" Architecture:
+    - Discrete action space: BUY=0, SELL=1, HOLD=2
+    - Frame Stacking: M5 (1 bar, 50-dim) + M1 (5 bars, 250-dim) = 300-dim flat obs
+    - ATR Normalization: price features scaled by rolling ATR
+    - No confidence gate -- every BUY/SELL immediately executes
+    - Fixed lot (0.01), fixed SL (1.5x ATR), fixed TP (2.0x ATR)
+    - action_mode param: "discrete" (Stage 1) or "continuous" (Stage 2+)
 """
 
 from __future__ import annotations
@@ -33,9 +26,7 @@ from environments.reward_engine import RewardBreakdown, RewardEngine
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────
-# Position Tracking
-# ─────────────────────────────────────────
+# --- Position Tracking ---
 
 @dataclass
 class Position:
@@ -50,35 +41,23 @@ class Position:
     spread_cost: float = 0.0  # Cost paid at entry
 
 
-# ─────────────────────────────────────────
-# Multi-TF Trading Environment
-# ─────────────────────────────────────────
+# --- Multi-TF Trading Environment ---
 
 class MultiTFTradingEnv(gym.Env):
     """
-    Multi-Timeframe Trading Environment for Cognitive Architecture.
+    Multi-Timeframe Trading Environment.
 
-    Accepts 4 separate OHLCV+feature arrays and returns dict observations
-    with fixed-size windows per timeframe.
+    V3.3 supports two action modes:
+        - "discrete": Discrete(3) BUY/SELL/HOLD for Stage 1
+        - "continuous": Box(5,) for Stage 2+ (legacy)
 
-    Observation Space (Dict):
-        {
-            "m1":  Box(128, 50),  — M1 window (sniper entry)
-            "m5":  Box(64, 50),   — M5 window (normal entry)
-            "m15": Box(48, 50),   — M15 window (structure)
-            "h1":  Box(24, 50),   — H1 window (trend bias)
-        }
-
-    Action Space (continuous, Box):
-        [confidence, risk_fraction, sl_mult, tp_mult]
-
-    Stepping uses M5 as the primary timeframe — each step() advances
-    one M5 bar, and M1/M15/H1 bars are aligned by timestamp.
+    Observation (V3.3 discrete mode):
+        Flat Box(300,) = 1 M5 bar (50-dim) + 5 M1 bars (5 x 50 = 250-dim)
     """
 
     metadata = {"render_modes": ["human"]}
 
-    # Default lookback windows per timeframe
+    # Legacy lookback (for continuous mode compatibility)
     LOOKBACK_M1: int = 128
     LOOKBACK_M5: int = 64
     LOOKBACK_M15: int = 48
@@ -100,130 +79,134 @@ class MultiTFTradingEnv(gym.Env):
         close_idx: int = 4,
         render_mode: str | None = None,
         ohlcv_m5: np.ndarray | None = None,
+        action_mode: str = "discrete",  # V3.3: "discrete" or "continuous"
     ) -> None:
-        """
-        Args:
-            data_m1:  (N_m1, n_features) — M1 feature array
-            data_m5:  (N_m5, n_features) — M5 feature array (primary TF)
-            data_m15: (N_m15, n_features) — M15 feature array
-            data_h1:  (N_h1, n_features) — H1 feature array
-            config:    Dict from prop_rules.yaml
-            n_features: Number of features per bar (28 raw + 22 knowledge = 50)
-            initial_balance: Starting account balance
-            episode_length:  Max steps per episode (in M5 bars)
-            pip_value:  Price value of 1 pip
-            lot_value:  Contract size per lot
-            commission_per_lot: Round-trip commission per lot
-            close_idx:  Column index of close price in feature arrays (DEPRECATED)
-            render_mode: Gymnasium render mode
-            ohlcv_m5:  (N_m5, 5) — Raw OHLCV array [open,high,low,close,volume]
-                       Used for REAL price/ATR calculations. If None, synthetic
-                       prices are reconstructed from log_return (col 27).
-        """
         super().__init__()
 
-        # ─── Data (4 timeframes) ───
+        # --- Data (4 timeframes) ---
         self.data_m1 = data_m1.astype(np.float32)
         self.data_m5 = data_m5.astype(np.float32)
         self.data_m15 = data_m15.astype(np.float32)
         self.data_h1 = data_h1.astype(np.float32)
 
         self.n_features = n_features
-        self.close_idx = close_idx  # DEPRECATED — use ohlcv_m5 instead
+        self.close_idx = close_idx
         self.render_mode = render_mode
+        self.action_mode = action_mode
 
-        # ─── V3: Real OHLCV for price calculations ───
+        # --- V3: Real OHLCV for price calculations ---
         if ohlcv_m5 is not None:
             self.ohlcv_m5 = ohlcv_m5.astype(np.float32)
             self._use_real_ohlcv = True
             logger.info("V3: Using REAL OHLCV prices (shape=%s)", self.ohlcv_m5.shape)
         else:
-            # Fallback: reconstruct synthetic prices from log_return (col 27)
             self._use_real_ohlcv = False
-            log_ret_col = 27  # log_return column index in 50-dim features
+            log_ret_col = 27
             log_returns = data_m5[:, log_ret_col].astype(np.float64)
-            # Reconstruct synthetic close prices from cumulative log returns
-            # Start from a reference price of 1000.0 (arbitrary but stable)
             cum_log_ret = np.cumsum(np.nan_to_num(log_returns, nan=0.0))
-            # Clamp to prevent float overflow (range: ~37 → exp(37) ≈ 1e16)
             cum_log_ret = np.clip(cum_log_ret, -20.0, 20.0)
             synthetic_close = 1000.0 * np.exp(cum_log_ret)
-            # Replace any inf/nan with 1000.0
             synthetic_close = np.nan_to_num(synthetic_close, nan=1000.0, posinf=1e8, neginf=100.0)
-            # Build synthetic OHLCV (close-only, H/L approximated)
             self.ohlcv_m5 = np.column_stack([
-                synthetic_close,                     # open ≈ close
-                synthetic_close * 1.001,             # high
-                synthetic_close * 0.999,             # low
-                synthetic_close,                     # close
-                np.ones(len(synthetic_close)),        # volume (dummy)
+                synthetic_close,
+                synthetic_close * 1.001,
+                synthetic_close * 0.999,
+                synthetic_close,
+                np.ones(len(synthetic_close)),
             ]).astype(np.float32)
-            logger.warning("V3: No OHLCV provided — using SYNTHETIC prices from log_return")
+            logger.warning("V3: No OHLCV provided -- using SYNTHETIC prices")
 
-        # Time alignment ratios (how many M1 bars per M5 bar, etc.)
-        # M1:M5 = 5:1, M5:M15 = 3:1, M15:H1 = 4:1
+        # Time alignment ratios
         self.m1_per_m5 = 5
         self.m5_per_m15 = 3
         self.m15_per_h1 = 4
-
-        # Total M5 bars available (primary TF drives stepping)
         self.n_m5_bars = len(self.data_m5)
 
-        # ─── Config ───
+        # --- V3.3: Precompute rolling ATR for normalization ---
+        self.atr_array = self._precompute_atr(period=14)
+
+        # --- Config ---
         self.config = config
         self.initial_balance = initial_balance
-        self.episode_length = min(episode_length, self.n_m5_bars - self.LOOKBACK_M5 - 1)
+        self.episode_length = min(episode_length, self.n_m5_bars - 70 - 1)
         self.pip_value = pip_value
         self.lot_value = lot_value
         self.commission_per_lot = commission_per_lot
 
-        # Load Prop Firm rules from config
+        # Prop Firm rules
         self.max_daily_dd = config.get("max_daily_drawdown", 0.05)
         self.max_total_dd = config.get("max_total_drawdown", 0.10)
         self.max_lots = config.get("max_lots_per_trade", 10.0)
         self.max_positions = config.get("max_open_positions", 5)
+        self.trading_start = config.get("trading_start_utc", 1)
+        self.trading_end = config.get("trading_end_utc", 22)
+
+        # V3.3 Stage 1: Fixed trade parameters (no learning needed)
+        self.fixed_lot = config.get("stage1_fixed_lot", 0.01)
+        self.fixed_sl_mult = config.get("stage1_sl_mult", 1.5)
+        self.fixed_tp_mult = config.get("stage1_tp_mult", 2.0)
+
+        # Legacy thresholds (continuous mode only)
         self.confidence_threshold = config.get("confidence_threshold", 0.15)
         self.m5_threshold = config.get("m5_normal_threshold", 0.50)
         self.m1_threshold = config.get("m1_sniper_threshold", 0.85)
-        self.trading_start = config.get("trading_start_utc", 1)
-        self.trading_end = config.get("trading_end_utc", 22)  # Intraday close by 22:00
 
-        # ─── Components ───
+        # --- Components ---
         self.physics = MarketPhysics(config)
         self.reward_engine = RewardEngine(config)
 
-        # ─── Spaces ───
-        self.observation_space = spaces.Dict({
-            "m1": spaces.Box(
+        # --- Spaces ---
+        if self.action_mode == "discrete":
+            # V3.3: BUY=0, SELL=1, HOLD=2
+            self.action_space = spaces.Discrete(3)
+            # Flat obs: 1 M5 bar (50) + 5 M1 bars (250) = 300-dim
+            self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(self.LOOKBACK_M1, n_features),
+                shape=(300,),
                 dtype=np.float32,
-            ),
-            "m5": spaces.Box(
-                low=-10.0, high=10.0,
-                shape=(self.LOOKBACK_M5, n_features),
+            )
+        else:
+            # Legacy continuous mode
+            self.observation_space = spaces.Dict({
+                "m1": spaces.Box(low=-10.0, high=10.0, shape=(self.LOOKBACK_M1, n_features), dtype=np.float32),
+                "m5": spaces.Box(low=-10.0, high=10.0, shape=(self.LOOKBACK_M5, n_features), dtype=np.float32),
+                "m15": spaces.Box(low=-10.0, high=10.0, shape=(self.LOOKBACK_M15, n_features), dtype=np.float32),
+                "h1": spaces.Box(low=-10.0, high=10.0, shape=(self.LOOKBACK_H1, n_features), dtype=np.float32),
+            })
+            self.action_space = spaces.Box(
+                low=np.array([-1.0, -1.0, 0.0, 0.5, 0.5], dtype=np.float32),
+                high=np.array([1.0, 1.0, 1.0, 3.0, 5.0], dtype=np.float32),
                 dtype=np.float32,
-            ),
-            "m15": spaces.Box(
-                low=-10.0, high=10.0,
-                shape=(self.LOOKBACK_M15, n_features),
-                dtype=np.float32,
-            ),
-            "h1": spaces.Box(
-                low=-10.0, high=10.0,
-                shape=(self.LOOKBACK_H1, n_features),
-                dtype=np.float32,
-            ),
-        })
+            )
 
-        self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, 0.0, 0.5, 0.5], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0, 3.0, 5.0], dtype=np.float32),
-            dtype=np.float32,
-        )
-
-        # ─── State (initialized in reset) ───
+        # --- State ---
         self._reset_state()
+
+    def _precompute_atr(self, period: int = 14) -> np.ndarray:
+        """Precompute rolling ATR from OHLCV for normalization."""
+        ohlcv = self.ohlcv_m5
+        highs = ohlcv[:, 1]
+        lows = ohlcv[:, 2]
+        closes = ohlcv[:, 3]
+
+        # True Range
+        tr = np.zeros(len(ohlcv), dtype=np.float32)
+        tr[0] = highs[0] - lows[0]
+        for i in range(1, len(ohlcv)):
+            tr1 = highs[i] - lows[i]
+            tr2 = abs(highs[i] - closes[i - 1])
+            tr3 = abs(lows[i] - closes[i - 1])
+            tr[i] = max(tr1, tr2, tr3)
+
+        # Rolling mean (SMA of True Range)
+        atr = np.zeros(len(ohlcv), dtype=np.float32)
+        for i in range(len(ohlcv)):
+            start = max(0, i - period + 1)
+            atr[i] = np.mean(tr[start:i + 1])
+
+        # Prevent division by zero
+        atr = np.maximum(atr, 1e-8)
+        return atr
 
     def _reset_state(self) -> None:
         """Initialize or reset all episode state."""
@@ -234,29 +217,25 @@ class MultiTFTradingEnv(gym.Env):
 
         self.positions: list[Position] = []
         self.trade_history: list[dict] = []
-        self.current_m5_step = 0       # Index into data_m5
+        self.current_m5_step = 0
         self.start_m5_step = 0
         self.trades_today = 0
         self.steps_since_last_trade = 0
         self.prev_unrealized = 0.0
         self._next_ticket = 1
 
-    # ─────────────────────────────────────────
-    # Gymnasium API
-    # ─────────────────────────────────────────
+    # --- Gymnasium API ---
 
     def reset(
         self,
         seed: int | None = None,
         options: dict | None = None,
-    ) -> tuple[dict[str, np.ndarray], dict]:
+    ) -> tuple:
         """Reset environment for a new episode."""
         super().reset(seed=seed)
-
         self._reset_state()
 
-        # Ensure enough lookback for all TFs
-        min_start_m5 = self.LOOKBACK_M5
+        min_start_m5 = max(self.LOOKBACK_M5, 15)  # Need ATR warmup
         max_start_m5 = self.n_m5_bars - self.episode_length - 1
 
         if max_start_m5 > min_start_m5:
@@ -270,69 +249,50 @@ class MultiTFTradingEnv(gym.Env):
         info = self._get_info()
         return obs, info
 
-    def step(
-        self, action: np.ndarray,
-    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict]:
+    def step(self, action) -> tuple:
         """
         Execute one M5 time step.
 
         Args:
-            action: [confidence, risk_fraction, sl_mult, tp_mult]
-
-        Returns:
-            (observation, reward, terminated, truncated, info)
+            action: int (discrete mode: 0=BUY, 1=SELL, 2=HOLD)
+                    or np.ndarray (continuous mode)
         """
         self.current_m5_step += 1
         self.steps_since_last_trade += 1
 
-        # Current price (from M5 close)
         price = self._get_current_price()
         hour_utc = self._get_simulated_hour()
 
-        # Parse action (5-dim: confidence, entry_type, risk_frac, sl_mult, tp_mult)
-        confidence = float(np.clip(action[0], -1.0, 1.0))
-        entry_type_raw = float(np.clip(action[1], -1.0, 1.0))  # <0 = M5, >0 = M1
-        risk_fraction = float(np.clip(action[2], 0.0, 1.0))
-        sl_mult = float(np.clip(action[3], 0.5, 3.0))
-        tp_mult = float(np.clip(action[4], 0.5, 5.0))
+        if self.action_mode == "discrete":
+            return self._step_discrete(int(action), price, hour_utc)
+        else:
+            return self._step_continuous(action, price, hour_utc)
 
-        # Determine entry type with DUAL THRESHOLDS
-        entry_type_str = "standby"  # Default: no trade
-        abs_conf = abs(confidence)
-        if entry_type_raw > 0 and abs_conf >= self.m1_threshold:
-            entry_type_str = "m1_sniper"
-        elif entry_type_raw <= 0 and abs_conf >= self.m5_threshold:
-            entry_type_str = "m5_normal"
+    def _step_discrete(self, action: int, price: float, hour_utc: int) -> tuple:
+        """V3.3 Stage 1: Discrete BUY/SELL/HOLD step."""
+        # action: 0=BUY, 1=SELL, 2=HOLD
 
-        # ─── Check existing positions (SL/TP hits) ───
+        # --- Check existing positions (SL/TP hits) ---
         realized_pnl = 0.0
         rr_ratio = 0.0
         trade_closed = False
 
-        positions_to_close = []
-        for pos in self.positions:
+        for pos in list(self.positions):
             hit, pnl, rr = self._check_sl_tp(pos, price)
             if hit:
-                positions_to_close.append((pos, pnl, rr))
+                realized_pnl += pnl
+                rr_ratio = max(rr_ratio, rr)
+                trade_closed = True
+                self.balance += pnl
+                self.positions.remove(pos)
+                self.trade_history.append({
+                    "ticket": pos.ticket, "direction": pos.direction,
+                    "entry": pos.entry_price, "exit": price,
+                    "pnl": pnl, "lots": pos.lots,
+                    "duration": self.current_m5_step - pos.entry_step,
+                })
 
-        for pos, pnl, rr in positions_to_close:
-            realized_pnl += pnl
-            rr_ratio = max(rr_ratio, rr)
-            trade_closed = True
-            self.balance += pnl
-            self.positions.remove(pos)
-            self.trade_history.append({
-                "ticket": pos.ticket,
-                "direction": pos.direction,
-                "entry": pos.entry_price,
-                "exit": price,
-                "pnl": pnl,
-                "lots": pos.lots,
-                "duration": self.current_m5_step - pos.entry_step,
-            })
-
-        # ─── Intraday session close ───
-        # Force close all positions at session end
+        # --- Session close ---
         if hour_utc >= self.trading_end and self.positions:
             for pos in list(self.positions):
                 pnl = self._calc_position_pnl(pos, price)
@@ -340,43 +300,30 @@ class MultiTFTradingEnv(gym.Env):
                 trade_closed = True
                 self.balance += pnl
                 self.trade_history.append({
-                    "ticket": pos.ticket,
-                    "direction": pos.direction,
-                    "entry": pos.entry_price,
-                    "exit": price,
-                    "pnl": pnl,
-                    "lots": pos.lots,
+                    "ticket": pos.ticket, "direction": pos.direction,
+                    "entry": pos.entry_price, "exit": price,
+                    "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
                     "close_reason": "SESSION_END",
                 })
             self.positions.clear()
 
-        # ─── Action Gating ───
+        # --- Execute action (NO gate, direct execution) ---
         trade_opened = False
         spread_cost = 0.0
-        lot_size = 0.0
 
-        if entry_type_str in ("m5_normal", "m1_sniper"):
-            direction = 1 if confidence > 0 else -1
+        if action in (0, 1):  # BUY or SELL
+            direction = 1 if action == 0 else -1
 
-            # Check: can we open a new position?
             if (
                 len(self.positions) < self.max_positions
                 and self.trading_start <= hour_utc < self.trading_end
             ):
-                # Calculate lot size
-                scaled_confidence = (abs_conf - self.confidence_threshold) / (
-                    1.0 - self.confidence_threshold
-                )
-                lot_size = risk_fraction * self.max_lots * scaled_confidence
-                lot_size = max(0.01, min(lot_size, self.max_lots))
-
-                # ATR estimate for SL/TP
+                lot_size = self.fixed_lot
                 atr_pips = self._estimate_atr_pips(price)
-                sl_pips = atr_pips * sl_mult
-                tp_pips = atr_pips * tp_mult
+                sl_pips = atr_pips * self.fixed_sl_mult
+                tp_pips = atr_pips * self.fixed_tp_mult
 
-                # Execute through physics
                 exec_result = self.physics.execute_order(
                     price=price,
                     direction=direction,
@@ -386,7 +333,6 @@ class MultiTFTradingEnv(gym.Env):
                 )
 
                 if exec_result.filled:
-                    # Calculate SL/TP prices
                     if direction > 0:  # BUY
                         sl_price = exec_result.fill_price - sl_pips * self.pip_value
                         tp_price = exec_result.fill_price + tp_pips * self.pip_value
@@ -394,11 +340,9 @@ class MultiTFTradingEnv(gym.Env):
                         sl_price = exec_result.fill_price + sl_pips * self.pip_value
                         tp_price = exec_result.fill_price - tp_pips * self.pip_value
 
-                    # Commission
                     commission = self.commission_per_lot * exec_result.fill_lots
                     self.balance -= commission
 
-                    # Create position
                     pos = Position(
                         ticket=self._next_ticket,
                         direction=direction,
@@ -416,17 +360,172 @@ class MultiTFTradingEnv(gym.Env):
                     trade_opened = True
                     spread_cost = pos.spread_cost
 
-        # ─── Update equity ───
+        # --- Update equity ---
         unrealized = self._total_unrealized_pnl(price)
         self.equity = self.balance + unrealized
         self.peak_equity = max(self.peak_equity, self.equity)
         self.daily_peak = max(self.daily_peak, self.equity)
 
-        # ─── Calculate drawdown ───
+        # --- Calculate reward ---
+        breakdown = self.reward_engine.calculate(
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized,
+            prev_unrealized_pnl=self.prev_unrealized,
+            has_open_positions=len(self.positions) > 0,
+            spread_cost=spread_cost,
+            commission=self.commission_per_lot * (self.fixed_lot if trade_opened else 0),
+            trades_today=self.trades_today,
+            steps_since_last_trade=self.steps_since_last_trade,
+            account_balance=self.balance,
+            trade_just_opened=trade_opened,
+            trade_just_closed=trade_closed,
+            hour_utc=hour_utc,
+        )
+
+        self.prev_unrealized = unrealized
+        reward = float(breakdown.total)
+        reward = reward / 100.0
+        reward = max(-10.0, min(10.0, reward))
+
+        # --- Termination ---
+        terminated = False
+        truncated = False
+
+        done, reason = self.reward_engine.is_episode_done(
+            max(0, (self.daily_peak - self.equity) / max(self.daily_peak, 1)),
+            max(0, (self.peak_equity - self.equity) / max(self.peak_equity, 1)),
+            self.max_total_dd,
+        )
+        if done:
+            terminated = True
+
+        if self.current_m5_step - self.start_m5_step >= self.episode_length:
+            truncated = True
+        if self.current_m5_step >= self.n_m5_bars - 1:
+            truncated = True
+
+        obs = self._get_observation()
+        info = self._get_info()
+        info["reward_breakdown"] = breakdown.to_dict()
+
+        return obs, reward, terminated, truncated, info
+
+    def _step_continuous(self, action: np.ndarray, price: float, hour_utc: int) -> tuple:
+        """Legacy continuous action step (V3.2 compatible). For Stage 2+."""
+        # Parse 5-dim action
+        confidence = float(np.clip(action[0], -1.0, 1.0))
+        entry_type_raw = float(np.clip(action[1], -1.0, 1.0))
+        risk_fraction = float(np.clip(action[2], 0.0, 1.0))
+        sl_mult = float(np.clip(action[3], 0.5, 3.0))
+        tp_mult = float(np.clip(action[4], 0.5, 5.0))
+
+        entry_type_str = "standby"
+        abs_conf = abs(confidence)
+        if entry_type_raw > 0 and abs_conf >= self.m1_threshold:
+            entry_type_str = "m1_sniper"
+        elif entry_type_raw <= 0 and abs_conf >= self.m5_threshold:
+            entry_type_str = "m5_normal"
+
+        # --- Check SL/TP ---
+        realized_pnl = 0.0
+        rr_ratio = 0.0
+        trade_closed = False
+
+        for pos in list(self.positions):
+            hit, pnl, rr = self._check_sl_tp(pos, price)
+            if hit:
+                realized_pnl += pnl
+                rr_ratio = max(rr_ratio, rr)
+                trade_closed = True
+                self.balance += pnl
+                self.positions.remove(pos)
+                self.trade_history.append({
+                    "ticket": pos.ticket, "direction": pos.direction,
+                    "entry": pos.entry_price, "exit": price,
+                    "pnl": pnl, "lots": pos.lots,
+                    "duration": self.current_m5_step - pos.entry_step,
+                })
+
+        # --- Session close ---
+        if hour_utc >= self.trading_end and self.positions:
+            for pos in list(self.positions):
+                pnl = self._calc_position_pnl(pos, price)
+                realized_pnl += pnl
+                trade_closed = True
+                self.balance += pnl
+                self.trade_history.append({
+                    "ticket": pos.ticket, "direction": pos.direction,
+                    "entry": pos.entry_price, "exit": price,
+                    "pnl": pnl, "lots": pos.lots,
+                    "duration": self.current_m5_step - pos.entry_step,
+                    "close_reason": "SESSION_END",
+                })
+            self.positions.clear()
+
+        # --- Action Gating ---
+        trade_opened = False
+        spread_cost = 0.0
+        lot_size = 0.0
+
+        if entry_type_str in ("m5_normal", "m1_sniper"):
+            direction = 1 if confidence > 0 else -1
+
+            if (
+                len(self.positions) < self.max_positions
+                and self.trading_start <= hour_utc < self.trading_end
+            ):
+                scaled_confidence = (abs_conf - self.confidence_threshold) / (
+                    1.0 - self.confidence_threshold
+                )
+                lot_size = risk_fraction * self.max_lots * scaled_confidence
+                lot_size = max(0.01, min(lot_size, self.max_lots))
+
+                atr_pips = self._estimate_atr_pips(price)
+                sl_pips = atr_pips * sl_mult
+                tp_pips = atr_pips * tp_mult
+
+                exec_result = self.physics.execute_order(
+                    price=price, direction=direction,
+                    lot_size=lot_size, hour_utc=hour_utc,
+                    pip_value=self.pip_value,
+                )
+
+                if exec_result.filled:
+                    if direction > 0:
+                        sl_price = exec_result.fill_price - sl_pips * self.pip_value
+                        tp_price = exec_result.fill_price + tp_pips * self.pip_value
+                    else:
+                        sl_price = exec_result.fill_price + sl_pips * self.pip_value
+                        tp_price = exec_result.fill_price - tp_pips * self.pip_value
+
+                    commission = self.commission_per_lot * exec_result.fill_lots
+                    self.balance -= commission
+
+                    pos = Position(
+                        ticket=self._next_ticket, direction=direction,
+                        entry_price=exec_result.fill_price,
+                        lots=exec_result.fill_lots,
+                        sl_price=sl_price, tp_price=tp_price,
+                        entry_step=self.current_m5_step,
+                        spread_cost=exec_result.spread_pips * self.pip_value * exec_result.fill_lots * self.lot_value,
+                    )
+                    self._next_ticket += 1
+                    self.positions.append(pos)
+                    self.trades_today += 1
+                    self.steps_since_last_trade = 0
+                    trade_opened = True
+                    spread_cost = pos.spread_cost
+
+        # --- Equity ---
+        unrealized = self._total_unrealized_pnl(price)
+        self.equity = self.balance + unrealized
+        self.peak_equity = max(self.peak_equity, self.equity)
+        self.daily_peak = max(self.daily_peak, self.equity)
+
         daily_dd = max(0, (self.daily_peak - self.equity) / self.daily_peak)
         total_dd = max(0, (self.peak_equity - self.equity) / self.peak_equity)
 
-        # ─── Calculate reward ───
+        # --- Reward ---
         breakdown = self.reward_engine.calculate(
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized,
@@ -442,35 +541,24 @@ class MultiTFTradingEnv(gym.Env):
             account_balance=self.balance,
             trade_just_opened=trade_opened,
             trade_just_closed=trade_closed,
-            # V3.2: Pass confidence magnitude for trade_attempt_shaping
             abs_confidence=abs_conf,
         )
 
         self.prev_unrealized = unrealized
         reward = float(breakdown.total)
-
-        # V3: Reward scaling — raw PnL from real prices can be huge (e.g. $500+),
-        # causing critic loss to explode to inf. Scale down and clip.
         reward = reward / 100.0
         reward = max(-10.0, min(10.0, reward))
 
-        # ─── Check termination ───
+        # --- Termination ---
         terminated = False
         truncated = False
 
-        done, reason = self.reward_engine.is_episode_done(
-            daily_dd, total_dd, self.max_total_dd,
-        )
+        done, reason = self.reward_engine.is_episode_done(daily_dd, total_dd, self.max_total_dd)
         if done:
             terminated = True
-            logger.debug("Episode terminated: %s", reason)
 
-        # Truncate if episode length reached
-        steps_elapsed = self.current_m5_step - self.start_m5_step
-        if steps_elapsed >= self.episode_length:
+        if self.current_m5_step - self.start_m5_step >= self.episode_length:
             truncated = True
-
-        # Truncate if out of M5 data
         if self.current_m5_step >= self.n_m5_bars - 1:
             truncated = True
 
@@ -480,134 +568,120 @@ class MultiTFTradingEnv(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
-    # ─────────────────────────────────────────
-    # Observation Construction
-    # ─────────────────────────────────────────
+    # --- Observation Construction ---
 
-    def _get_observation(self) -> dict[str, np.ndarray]:
+    def _get_observation(self):
+        """Build observation based on action_mode."""
+        if self.action_mode == "discrete":
+            return self._get_obs_discrete()
+        else:
+            return self._get_obs_continuous()
+
+    def _get_obs_discrete(self) -> np.ndarray:
         """
-        Build dict observation from 4 timeframes.
+        V3.3: Flat 300-dim observation.
+        = 1 M5 bar (50-dim) + 5 M1 bars (5 x 50 = 250-dim)
 
-        Each TF returns a fixed-size window ending at the current aligned bar.
-        If not enough bars available, zero-pad on the left.
+        All features normalized by ATR where applicable.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
+        atr = self.atr_array[m5_idx]
 
-        # M5 window
+        # M5: current bar (50-dim)
+        m5_bar = self.data_m5[m5_idx].copy()
+        # Normalize price-based features (first ~10 columns are price-derived)
+        m5_bar[:10] = m5_bar[:10] / atr
+
+        # M1: last 5 bars
+        m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
+        m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
+        m1_window = self.data_m1[m1_start_idx:m1_end_idx + 1].copy()
+
+        # Normalize M1 features by ATR
+        m1_window[:, :10] = m1_window[:, :10] / atr
+
+        # Zero-pad if fewer than 5 M1 bars
+        if len(m1_window) < 5:
+            pad = np.zeros((5 - len(m1_window), self.n_features), dtype=np.float32)
+            m1_window = np.vstack([pad, m1_window])
+
+        # Flatten: M5 (50) + M1 (250) = 300
+        obs = np.concatenate([m5_bar, m1_window.flatten()]).astype(np.float32)
+
+        # Clip to prevent extreme values
+        obs = np.clip(obs, -10.0, 10.0)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        return obs
+
+    def _get_obs_continuous(self) -> dict[str, np.ndarray]:
+        """Legacy dict observation for continuous mode."""
+        m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
+
         m5_obs = self._get_window(self.data_m5, m5_idx, self.LOOKBACK_M5)
-
-        # M1: 5 M1 bars per M5 bar
         m1_idx = min(m5_idx * self.m1_per_m5, len(self.data_m1) - 1)
         m1_obs = self._get_window(self.data_m1, m1_idx, self.LOOKBACK_M1)
-
-        # M15: 1 M15 bar per 3 M5 bars
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_obs = self._get_window(self.data_m15, m15_idx, self.LOOKBACK_M15)
-
-        # H1: 1 H1 bar per 12 M5 bars (= 4 M15 bars)
         h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
         h1_obs = self._get_window(self.data_h1, h1_idx, self.LOOKBACK_H1)
 
-        return {
-            "m1": m1_obs,
-            "m5": m5_obs,
-            "m15": m15_obs,
-            "h1": h1_obs,
-        }
+        return {"m1": m1_obs, "m5": m5_obs, "m15": m15_obs, "h1": h1_obs}
 
     def _get_window(
         self, data: np.ndarray, end_idx: int, window_size: int,
     ) -> np.ndarray:
-        """
-        Extract a fixed-size window ending at end_idx (inclusive).
-        Zero-pads on the left if not enough bars exist.
-        """
+        """Extract a fixed-size window ending at end_idx."""
         start_idx = max(0, end_idx - window_size + 1)
         window = data[start_idx:end_idx + 1]
-
-        # Zero-pad if window is too small
         if len(window) < window_size:
             pad_size = window_size - len(window)
             padding = np.zeros((pad_size, data.shape[1]), dtype=np.float32)
             window = np.vstack([padding, window])
-
         return window.copy()
 
-    # ─────────────────────────────────────────
-    # Internal Helpers
-    # ─────────────────────────────────────────
+    # --- Internal Helpers ---
 
     def _get_current_price(self) -> float:
-        """Get current close price from real OHLCV (V3 fix)."""
         idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
-        return float(self.ohlcv_m5[idx, 3])  # Column 3 = close
+        return float(self.ohlcv_m5[idx, 3])
 
     def _get_current_high(self) -> float:
-        """Get current high price from OHLCV."""
         idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
-        return float(self.ohlcv_m5[idx, 1])  # Column 1 = high
+        return float(self.ohlcv_m5[idx, 1])
 
     def _get_current_low(self) -> float:
-        """Get current low price from OHLCV."""
         idx = min(self.current_m5_step, len(self.ohlcv_m5) - 1)
-        return float(self.ohlcv_m5[idx, 2])  # Column 2 = low
+        return float(self.ohlcv_m5[idx, 2])
 
     def _get_simulated_hour(self) -> int:
-        """Simulate hour of day from M5 step index (M5 = 5 min bars)."""
         minutes = (self.current_m5_step * 5) % (24 * 60)
         return minutes // 60
 
     def _estimate_atr_pips(self, price: float) -> float:
-        """Estimate ATR in pips from REAL OHLCV high/low/close (V3 fix).
-
-        Uses True Range: max(H-L, |H-Cprev|, |L-Cprev|)
-        """
-        lookback = min(14, self.current_m5_step - self.start_m5_step)
-        if lookback < 2:
-            # Default ATR based on price scale
-            return max(price * 0.001 / self.pip_value, 5.0)
-
-        start = max(0, self.current_m5_step - lookback)
-        end = self.current_m5_step + 1
-        ohlcv_window = self.ohlcv_m5[start:end]
-        highs = ohlcv_window[:, 1]
-        lows = ohlcv_window[:, 2]
-        closes = ohlcv_window[:, 3]
-
-        # True Range calculation
-        tr1 = highs[1:] - lows[1:]                    # H - L
-        tr2 = np.abs(highs[1:] - closes[:-1])          # |H - Cprev|
-        tr3 = np.abs(lows[1:] - closes[:-1])            # |L - Cprev|
-        true_range = np.maximum(np.maximum(tr1, tr2), tr3)
-        atr = float(np.mean(true_range))
-        atr_pips = atr / self.pip_value
-
+        """Get ATR in pips from precomputed array."""
+        idx = min(self.current_m5_step, len(self.atr_array) - 1)
+        atr_price = float(self.atr_array[idx])
+        atr_pips = atr_price / self.pip_value
         return max(atr_pips, 5.0)
 
     def _total_unrealized_pnl(self, current_price: float) -> float:
-        """Calculate total unrealized PnL across all open positions."""
         total = 0.0
         for pos in self.positions:
             total += self._calc_position_pnl(pos, current_price)
         return total
 
     def _calc_position_pnl(self, pos: Position, current_price: float) -> float:
-        """Calculate PnL for a single position."""
         price_diff = (current_price - pos.entry_price) * pos.direction
         return price_diff * pos.lots * self.lot_value
 
     def _check_sl_tp(
         self, pos: Position, current_price: float,
     ) -> tuple[bool, float, float]:
-        """
-        Check if SL or TP hit for a position.
-        Returns: (hit, pnl, risk_reward_ratio)
-        """
         if pos.direction > 0:  # LONG
             if current_price <= pos.sl_price:
                 pnl = (pos.sl_price - pos.entry_price) * pos.lots * self.lot_value
                 return True, pnl, 0.0
-
             if current_price >= pos.tp_price:
                 pnl = (pos.tp_price - pos.entry_price) * pos.lots * self.lot_value
                 risk = abs(pos.entry_price - pos.sl_price)
@@ -618,7 +692,6 @@ class MultiTFTradingEnv(gym.Env):
             if current_price >= pos.sl_price:
                 pnl = (pos.entry_price - pos.sl_price) * pos.lots * self.lot_value
                 return True, pnl, 0.0
-
             if current_price <= pos.tp_price:
                 pnl = (pos.entry_price - pos.tp_price) * pos.lots * self.lot_value
                 risk = abs(pos.sl_price - pos.entry_price)
@@ -629,7 +702,6 @@ class MultiTFTradingEnv(gym.Env):
         return False, 0.0, 0.0
 
     def _get_info(self) -> dict[str, Any]:
-        """Build info dict for current step."""
         return {
             "balance": self.balance,
             "equity": self.equity,
@@ -642,5 +714,5 @@ class MultiTFTradingEnv(gym.Env):
         }
 
 
-# ── Legacy alias for backward compatibility ──
+# Legacy alias
 PropFirmTradingEnv = MultiTFTradingEnv

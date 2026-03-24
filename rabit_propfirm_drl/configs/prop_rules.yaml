@@ -50,6 +50,13 @@ exploration_bonus: 0.5          # Reward for opening a trade (decays with sqrt(t
 trade_attempt_bonus: 0.05       # Small reward when |confidence| > 0.20 (intent to trade)
 loss_dampening_factor: 0.5      # Scale realized losses to 50% (make trading < scary than HOLD)
 
+# ─── V3.3: "Ruong Vang" Stage 1 Config ───
+stage1_mode: true               # Enable simplified 3-component reward (trade_bonus + pnl + inaction)
+trade_bonus: 1.0                # +1.0 per trade opened (replaces exploration_bonus in stage1)
+stage1_fixed_lot: 0.01          # Fixed lot size for discrete mode
+stage1_sl_mult: 1.5             # SL = 1.5x ATR
+stage1_tp_mult: 2.0             # TP = 2.0x ATR
+
 # ─── Strict Risk Management ───
 max_loss_per_trade_pct: 0.003    # 0.3% max loss per single trade
 daily_loss_cooldown_pct: 0.03    # 3% daily loss → stop trading, resume next day
