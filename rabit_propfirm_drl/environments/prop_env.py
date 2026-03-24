@@ -1,14 +1,14 @@
 """
 PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-V3.4 -- "Quan Tri Rui Ro" Architecture:
+V3.5 -- "4-TF Hop The" Architecture:
     - Discrete action space: BUY=0, SELL=1, HOLD=2, CLOSE=3
-    - 3-TF Frame Stacking: M15 (1 bar, 50) + M5 (1 bar, 50) + M1 (5 bars, 250) = 350-dim
+    - 4-TF Frame Stacking: H1 (1 bar, 50) + M15 (1 bar, 50) + M5 (1 bar, 50) + M1 (5 bars, 250) = 400-dim
     - ATR Normalization: price features scaled by rolling ATR
     - Auto SL from M5 Swing Points (no fixed SL/TP)
     - Bot actively manages exits via CLOSE action
     - Fixed lot (0.01), SL at Swing Low/High, NO fixed TP
-    - action_mode param: "discrete" (V3.4) or "continuous" (legacy)
+    - action_mode param: "discrete" (V3.5) or "continuous" (legacy)
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ class MultiTFTradingEnv(gym.Env):
         - "discrete": Discrete(4) BUY/SELL/HOLD/CLOSE
         - "continuous": Box(5,) (legacy)
 
-    Observation (V3.4 discrete mode):
-        Flat Box(350,) = 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
+    Observation (V3.5 discrete mode):
+        Flat Box(400,) = 1 H1 bar (50) + 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -159,12 +159,12 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- Spaces ---
         if self.action_mode == "discrete":
-            # V3.4: BUY=0, SELL=1, HOLD=2, CLOSE=3
+            # V3.5: BUY=0, SELL=1, HOLD=2, CLOSE=3
             self.action_space = spaces.Discrete(4)
-            # Flat obs: 1 M15 (50) + 1 M5 (50) + 5 M1 (250) = 350-dim
+            # Flat obs: 1 H1 (50) + 1 M15 (50) + 1 M5 (50) + 5 M1 (250) = 400-dim
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(350,),
+                shape=(400,),
                 dtype=np.float32,
             )
         else:
@@ -649,25 +649,30 @@ class MultiTFTradingEnv(gym.Env):
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.4: Flat 350-dim observation.
-        = 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
+        V3.5: Flat 400-dim observation.
+        = 1 H1 bar (50) + 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
 
-        M15: trend context | M5: structure/OB | M1: entry precision
+        H1: macro trend | M15: structure context | M5: entry zone | M1: sniper precision
         All features normalized by ATR.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # M15: current bar (50-dim) — trend context
+        # H1: current bar (50-dim) — macro trend (BOS/CHoCH)
+        h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
+        h1_bar = self.data_h1[h1_idx].copy()
+        h1_bar[:10] = h1_bar[:10] / atr
+
+        # M15: current bar (50-dim) — structure context (OB/FVG)
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_bar = self.data_m15[m15_idx].copy()
         m15_bar[:10] = m15_bar[:10] / atr
 
-        # M5: current bar (50-dim) — structure/OB
+        # M5: current bar (50-dim) — entry zone
         m5_bar = self.data_m5[m5_idx].copy()
         m5_bar[:10] = m5_bar[:10] / atr
 
-        # M1: last 5 bars (250-dim) — entry precision
+        # M1: last 5 bars (250-dim) — sniper precision
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
         m1_window = self.data_m1[m1_start_idx:m1_end_idx + 1].copy()
@@ -678,8 +683,8 @@ class MultiTFTradingEnv(gym.Env):
             pad = np.zeros((5 - len(m1_window), self.n_features), dtype=np.float32)
             m1_window = np.vstack([pad, m1_window])
 
-        # Flatten: M15 (50) + M5 (50) + M1 (250) = 350
-        obs = np.concatenate([m15_bar, m5_bar, m1_window.flatten()]).astype(np.float32)
+        # Flatten: H1 (50) + M15 (50) + M5 (50) + M1 (250) = 400
+        obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_window.flatten()]).astype(np.float32)
 
         # Clip to prevent extreme values
         obs = np.clip(obs, -10.0, 10.0)
