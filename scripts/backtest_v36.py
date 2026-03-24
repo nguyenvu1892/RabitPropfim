@@ -73,7 +73,8 @@ def run_backtest():
                 ot = torch.nan_to_num(ot, nan=0.0)
                 with torch.no_grad():
                     logits, value, attn_w = model(ot)
-                    a_idx = int(torch.argmax(torch.softmax(logits, dim=-1)))
+                    dist = torch.distributions.Categorical(logits=logits)
+                    a_idx = int(dist.sample())
 
                 # Average attention across heads: (1, n_heads, 8, 8) -> (8, 8)
                 avg_attn = attn_w.squeeze(0).mean(dim=0).cpu().numpy()
