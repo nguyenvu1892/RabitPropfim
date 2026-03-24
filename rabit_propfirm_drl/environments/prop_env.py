@@ -447,6 +447,11 @@ class MultiTFTradingEnv(gym.Env):
         self.prev_unrealized = unrealized
         reward = float(breakdown.total)
 
+        # V3: Reward scaling — raw PnL from real prices can be huge (e.g. $500+),
+        # causing critic loss to explode to inf. Scale down and clip.
+        reward = reward / 100.0
+        reward = max(-10.0, min(10.0, reward))
+
         # ─── Check termination ───
         terminated = False
         truncated = False

@@ -116,7 +116,7 @@ STAGES: list[StageConfig] = [
         total_steps=200_000,
         learning_rate=1e-4,
         batch_size=2048,           # V3: from 256 → 2048
-        n_envs=32,                 # V3: from 16 → 32 (fill CPU cores)
+        n_envs=8,                  # V3: 8 envs (32 caused CPU IPC thrashing)
         n_steps=4096,              # V3: rollout buffer
         n_updates_per_rollout=8,   # V3: gradient updates per rollout
         use_m1=False, use_m5=False, use_m15=True, use_h1=True,
@@ -134,7 +134,7 @@ STAGES: list[StageConfig] = [
         total_steps=300_000,
         learning_rate=1e-4,
         batch_size=2048,           # V3: from 256 → 2048
-        n_envs=32,                 # V3: from 16 → 32
+        n_envs=8,                  # V3: 8 envs (32 caused IPC thrashing)
         n_steps=4096,
         n_updates_per_rollout=8,
         use_m1=False, use_m5=True, use_m15=True, use_h1=True,
@@ -152,7 +152,7 @@ STAGES: list[StageConfig] = [
         total_steps=500_000,
         learning_rate=5e-5,
         batch_size=4096,           # V3: push to 4096 (all TFs active, 4090 eats this)
-        n_envs=32,                 # V3: from 16 → 32
+        n_envs=8,                  # V3: 8 envs
         n_steps=8192,              # V3: longer rollout for full context
         n_updates_per_rollout=16,  # V3: more updates from richer data
         use_m1=True, use_m5=True, use_m15=True, use_h1=True,
@@ -490,16 +490,19 @@ def train_stage(
         """Factory function for AsyncVectorEnv."""
         def _init():
             sym_data = all_data["data"][sym]
+            _z1k = np.zeros((1000, 50), dtype=np.float32)
+            _z500 = np.zeros((500, 50), dtype=np.float32)
+            _z200 = np.zeros((200, 50), dtype=np.float32)
             env = MultiTFTradingEnv(
-                data_m1=sym_data.get("M1", np.zeros((1000, 50), dtype=np.float32)),
-                data_m5=sym_data["M5"],
-                data_m15=sym_data.get("M15", np.zeros((500, 50), dtype=np.float32)),
-                data_h1=sym_data.get("H1", np.zeros((200, 50), dtype=np.float32)),
+                data_m1=sym_data.get("M1") if sym_data.get("M1") is not None else _z1k,
+                data_m5=sym_data.get("M5") if sym_data.get("M5") is not None else _z500,
+                data_m15=sym_data.get("M15") if sym_data.get("M15") is not None else _z500,
+                data_h1=sym_data.get("H1") if sym_data.get("H1") is not None else _z200,
                 config=env_config,
                 n_features=50,
                 initial_balance=10_000.0,
                 episode_length=2000,
-                ohlcv_m5=sym_data.get("M5_ohlcv"),  # V3: pass real OHLCV
+                ohlcv_m5=sym_data.get("M5_ohlcv"),  # V3: pass real OHLCV (None triggers fallback)
             )
             env.reset(seed=seed)
             return env
