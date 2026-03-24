@@ -825,11 +825,13 @@ def train_stage2(
 
 def main():
     parser = argparse.ArgumentParser(description="V3.3 PPO Training")
-    parser.add_argument("--stage", type=int, default=1, help="Stage 1 or 2")
+    parser.add_argument("--stage", type=int, default=1, help="Stage 1, 2, or 3")
     parser.add_argument("--test", action="store_true", help="Quick test")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--n-envs", type=int, default=12)
     parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--il-coef", type=float, default=None, help="Imitation loss coef")
+    parser.add_argument("--ent-coef", type=float, default=None, help="Entropy coef")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -851,9 +853,48 @@ def main():
         train_stage2(
             total_steps=args.total_steps or 500_000,
             n_envs=args.n_envs, device=device, test_mode=args.test,
+            il_coef=args.il_coef or 0.3,
+            ent_coef=args.ent_coef or 0.02,
         )
+    elif args.stage == 3:
+        # Stage 3: Balanced VIP — lower IL, higher entropy, warm-start from S2
+        # Override best_checkpoint path to save Stage 3 separately
+        il = args.il_coef if args.il_coef is not None else 0.15
+        ent = args.ent_coef if args.ent_coef is not None else 0.05
+        logger.info("Stage 3: il_coef=%.2f, ent_coef=%.2f (balanced)", il, ent)
+
+        # Temporarily rename Stage 2 checkpoint for warm-start
+        s2_ckpt = MODELS_DIR / "best_v33_stage2.pt"
+        s1_ckpt = MODELS_DIR / "best_v33_stage1.pt"
+        warm_ckpt = s2_ckpt if s2_ckpt.exists() else s1_ckpt
+
+        # Monkey-patch to load from Stage 2 and save to Stage 3
+        import shutil
+        temp_s1 = MODELS_DIR / "_temp_s1_backup.pt"
+        if warm_ckpt.exists() and warm_ckpt != s1_ckpt:
+            shutil.copy2(s1_ckpt, temp_s1)
+            shutil.copy2(warm_ckpt, s1_ckpt)
+            logger.info("Warm-starting Stage 3 from Stage 2 checkpoint")
+
+        train_stage2(
+            total_steps=args.total_steps or 500_000,
+            n_envs=args.n_envs, device=device, test_mode=args.test,
+            il_coef=il,
+            ent_coef=ent,
+        )
+
+        # Rename output to stage3
+        s2_out = MODELS_DIR / "best_v33_stage2.pt"
+        s3_out = MODELS_DIR / "best_v33_stage3.pt"
+        if s2_out.exists():
+            shutil.copy2(s2_out, s3_out)
+            logger.info("Saved Stage 3 -> %s", s3_out)
+
+        # Restore original Stage 1
+        if temp_s1.exists():
+            shutil.move(str(temp_s1), str(s1_ckpt))
     else:
-        logger.error("Invalid stage: %d (use 1 or 2)", args.stage)
+        logger.error("Invalid stage: %d (use 1, 2, or 3)", args.stage)
         sys.exit(1)
 
 

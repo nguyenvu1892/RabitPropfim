@@ -141,7 +141,7 @@ def smc_score_trade(
     return score / n_checks, checks
 
 
-def harvest_vip_trades(n_episodes: int = 20, episode_length: int = 2000):
+def harvest_vip_trades(n_episodes: int = 20, episode_length: int = 2000, cap_per_symbol: int = 500):
     """Run Stage 1 model, capture trades, filter through SMC."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -285,6 +285,22 @@ def harvest_vip_trades(n_episodes: int = 20, episode_length: int = 2000):
                      sym, sym_trades, sym_vip,
                      100 * sym_vip / max(sym_trades, 1))
 
+    # Cap VIP per symbol to prevent imbalance
+    if cap_per_symbol > 0:
+        capped_vip = []
+        for sym in SYMBOLS:
+            sym_entries = [v for v in all_vip if v["symbol"] == sym]
+            if len(sym_entries) > cap_per_symbol:
+                # Keep highest SMC score entries
+                sym_entries.sort(key=lambda x: x["smc_score"], reverse=True)
+                sym_entries = sym_entries[:cap_per_symbol]
+                logger.info("  %s: CAPPED %d -> %d", sym, len([v for v in all_vip if v["symbol"] == sym]), cap_per_symbol)
+            capped_vip.extend(sym_entries)
+        total_before = total_accepted
+        all_vip = capped_vip
+        total_accepted = len(all_vip)
+        logger.info("  VIP CAPPED: %d -> %d (cap=%d/symbol)", total_before, total_accepted, cap_per_symbol)
+
     # Save VIP buffer
     vip_obs = np.array([v["obs"] for v in all_vip], dtype=np.float32)
     vip_actions = np.array([v["action"] for v in all_vip], dtype=np.int64)
@@ -342,4 +358,9 @@ def harvest_vip_trades(n_episodes: int = 20, episode_length: int = 2000):
 
 
 if __name__ == "__main__":
-    harvest_vip_trades(n_episodes=20, episode_length=2000)
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--episodes", type=int, default=20)
+    p.add_argument("--cap-per-symbol", type=int, default=500)
+    args = p.parse_args()
+    harvest_vip_trades(n_episodes=args.episodes, episode_length=2000, cap_per_symbol=args.cap_per_symbol)
