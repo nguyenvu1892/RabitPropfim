@@ -33,8 +33,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("v33_backtest")
 
 
-# Import PPO model from train script
-from scripts.train_v33 import PPOActorCritic
+
+# --- PPO Model (inline to avoid import issues) ---
+class PPOActorCritic(nn.Module):
+    def __init__(self, obs_dim=300, n_actions=3, hidden_dims=None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [512, 256, 128]
+        layers = []
+        in_dim = obs_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.LayerNorm(h_dim))
+            layers.append(nn.ReLU())
+            in_dim = h_dim
+        self.trunk = nn.Sequential(*layers)
+        self.actor_head = nn.Linear(hidden_dims[-1], n_actions)
+        self.critic_head = nn.Linear(hidden_dims[-1], 1)
+
+    def forward(self, obs):
+        features = self.trunk(obs)
+        return self.actor_head(features), self.critic_head(features)
 
 SYMBOLS = ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
 
