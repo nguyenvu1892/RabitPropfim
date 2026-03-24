@@ -39,6 +39,90 @@
 
 ---
 
+## 🧠 Kiến Thức Nạp Vào Bot (50-dim Features)
+
+Mỗi nến trên mỗi khung TF được biểu diễn bằng **50 chiều** (28 raw + 22 knowledge):
+
+### SMC — Smart Money Concepts (7 features)
+`distance_to_ob` · `is_in_fvg` · `trend_state (BOS/CHoCH)` · `liquidity_grab` · `swing_distance` · `swing_high` · `swing_low`
+
+### Pin Action — Price Action (8 features)
+`is_pinbar` · `is_doji` · `is_inside_bar` · `is_engulfing_bull` · `is_engulfing_bear` · `is_hammer` · `is_shooting_star` · `candle_strength`
+
+### Volume Profile (5 features)
+`vol_anomaly` · `vol_exhaustion` · `vol_climax` · `vol_trend` · `delta_approx`
+
+### Raw Features (28 features)
+`log_return` · `body_ratio` · `upper/lower_wick` · `relative_volume` · `ATR_normalized` · `sin/cos_time` · ...
+
+> **Bot không dùng indicator truyền thống** (RSI, MA, MACD). Tất cả kiến thức đều dựa trên cấu trúc giá (SMC), hành động giá (Pin Action), và dòng tiền (Volume).
+
+---
+
+## 🔄 Quy Trình Ra Quyết Định
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  H1: Trend lên hay xuống? (BOS/CHoCH)                       │
+│  └── Xác định: BUY ONLY / SELL ONLY / RANGE                 │
+├──────────────────────────────────────────────────────────────┤
+│  M15: Có Order Block / FVG ở đâu?                            │
+│  └── Xác định vùng giá mục tiêu (Supply/Demand)             │
+├──────────────────────────────────────────────────────────────┤
+│  M5: Giá chạm vùng chưa? Có hợp lưu H1+M15 không?          │
+│  └── ✅ Có hợp lưu → M5 ENTRY (tiêu chuẩn)                 │
+├──────────────────────────────────────────────────────────────┤
+│  M1: Volume nổ? Pin Bar chuẩn? Xác suất > 70%?              │
+│  └── ✅ Đủ điều kiện → 🔫 SNIPER ENTRY (chính xác cao)      │
+│  └── ❌ Không đủ → Bỏ qua, chờ M5 entry                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ⚠️ Quy Tắc Quản Trị Rủi Ro
+
+| Quy tắc | Giá trị | Mô tả |
+|---------|---------|-------|
+| **Max Loss/Trade** | **0.3%** | Mỗi lệnh thua tối đa 0.3% tài khoản — KHÔNG NGOẠI LỆ |
+| **Stop Loss** | Swing Point M5 | SL tự động đặt tại đáy/đỉnh gần nhất trên M5 + buffer ATR |
+| **Take Profit** | Không có TP cố định | Bot tự bấm nút CLOSE khi thấy lời — "gồng lời" linh hoạt |
+| **Daily DD Limit** | 5% | Thua 5% trong ngày → dừng giao dịch, chờ ngày mai |
+| **Total DD Limit** | 10% | Thua 10% tổng → Killswitch, đóng toàn bộ lệnh |
+| **Killswitch** | 4.5% | Buffer an toàn — force-close tất cả lệnh trước khi chạm 5% |
+| **Session Hours** | 01:00 - 21:00 UTC | Chỉ giao dịch trong giờ Asian → US session |
+| **Max Positions** | 5 | Tối đa 5 lệnh mở đồng thời |
+
+---
+
+## 🔁 Tự Tiến Hóa Mỗi Đêm (Nightly Auto-Retrain)
+
+> **Nguyên tắc:** Mỗi khi thị trường đóng cửa (21:00 UTC), bot tự động train lại trên data của ngày hôm đó, cập nhật kiến thức học được vào bộ nhớ để nâng tỉ lệ Win Rate.
+
+```
+21:00 UTC — Thị trường đóng cửa
+    │
+    ├── 1. Thu thập data M1/M5/M15/H1 của ngày hôm nay
+    │
+    ├── 2. Phân tích trade trong ngày:
+    │       ├── Lệnh WIN → Qua bộ lọc SMC → Nhập vào Rương Vàng (VIP Buffer)
+    │       └── Lệnh LOSS → Phân tích nguyên nhân → Cập nhật Episodic Memory
+    │
+    ├── 3. Fine-tune model:
+    │       ├── PPO update trên data mới (lr thấp = 1e-5, max 5 epochs)
+    │       └── IL update từ VIP Buffer mới (ép học form chuẩn bài)
+    │
+    ├── 4. Validation Gate:
+    │       ├── ✅ WR mới ≥ 90% WR cũ → Lưu model mới, deploy sáng mai
+    │       └── ❌ WR giảm quá → Rollback model cũ, giữ nguyên
+    │
+    └── 5. Cập nhật Bộ Nhớ (Episodic Memory):
+            ├── Thêm lệnh mẫu tốt vào k-NN Memory Bank
+            └── Xóa lệnh cũ kém chất lượng (FIFO 500 entries)
+
+01:00 UTC — Thị trường mở cửa → Bot deploy model mới, sẵn sàng chiến
+```
+
 ## 🏗️ Kiến Trúc Hệ Thống
 
 ```
