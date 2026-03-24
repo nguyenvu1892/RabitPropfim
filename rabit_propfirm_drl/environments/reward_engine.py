@@ -1,7 +1,7 @@
 """
 Reward Engine -- Multi-component reward function for DRL trading agent.
 
-11 Components:
+V3.2 — 13 Components (anti-mode-collapse):
  1. realized_pnl         -- Actual profit/loss when closing a trade
  2. unrealized_shaping   -- Mark-to-market shaping (delta per step)
  3. dd_penalty           -- Exponential drawdown penalty
@@ -13,6 +13,8 @@ Reward Engine -- Multi-component reward function for DRL trading agent.
  9. fomo_penalty         -- PENALTY for missing obvious M1 setups (oracle)
 10. sniper_multiplier    -- 3x loss penalty for failed Sniper (M1) entries
 11. sniper_bonus         -- 5x win bonus for successful Sniper (M1) entries
+12. exploration_bonus    -- V3.2: Reward for opening a trade (anti-HOLD collapse)
+13. trade_attempt_shaping -- V3.2: Small reward for showing trade intention
 
 All weights/thresholds from prop_rules.yaml -- zero hardcoding.
 """
@@ -43,6 +45,8 @@ class RewardBreakdown:
     fomo_penalty: float = 0.0
     sniper_multiplier: float = 0.0
     sniper_bonus: float = 0.0
+    exploration_bonus: float = 0.0       # V3.2: Reward for opening a trade
+    trade_attempt_shaping: float = 0.0   # V3.2: Reward for showing trade intention
 
     @property
     def total(self) -> float:
@@ -58,6 +62,8 @@ class RewardBreakdown:
             + self.fomo_penalty
             + self.sniper_multiplier
             + self.sniper_bonus
+            + self.exploration_bonus
+            + self.trade_attempt_shaping
         )
 
     def to_dict(self) -> dict[str, float]:
@@ -73,6 +79,8 @@ class RewardBreakdown:
             "fomo_penalty": self.fomo_penalty,
             "sniper_multiplier": self.sniper_multiplier,
             "sniper_bonus": self.sniper_bonus,
+            "exploration_bonus": self.exploration_bonus,
+            "trade_attempt_shaping": self.trade_attempt_shaping,
             "total": self.total,
         }
 
@@ -120,6 +128,11 @@ class RewardEngine:
         self.fomo_lookahead = config.get("fomo_lookahead_steps", 50)
         self.fomo_move_pct = config.get("fomo_move_threshold_pct", 0.005)
 
+        # V3.2: Anti-mode-collapse reward shaping
+        self.exploration_bonus_val = config.get("exploration_bonus", 0.5)
+        self.trade_attempt_bonus = config.get("trade_attempt_bonus", 0.05)
+        self.loss_dampening = config.get("loss_dampening_factor", 0.5)
+
     def calculate(
         self,
         realized_pnl: float = 0.0,
@@ -141,6 +154,8 @@ class RewardEngine:
         trade_won: bool = False,
         future_price_data: Optional[np.ndarray] = None,  # Oracle lookahead
         current_price: float = 0.0,
+        # V3.2: Anti-mode-collapse params
+        abs_confidence: float = 0.0,   # |confidence| from actor output
     ) -> RewardBreakdown:
         """
         Calculate all 11 reward components.
@@ -161,8 +176,13 @@ class RewardEngine:
         balance_norm = max(account_balance, 1.0)
 
         # --- Component 1: Realized PnL (with Asymmetric Sniper Multiplier) ---
+        # V3.2: Apply loss_dampening to reduce fear of losing trades
         if trade_just_closed and realized_pnl != 0:
             base_pnl = realized_pnl / balance_norm * 100  # As percentage
+
+            # V3.2: Dampen losses so bot isn't terrified of trading
+            if base_pnl < 0:
+                base_pnl = base_pnl * self.loss_dampening
 
             if entry_type == "m1_sniper":
                 if trade_won:
@@ -232,6 +252,19 @@ class RewardEngine:
             if max_move > self.fomo_move_pct:
                 # Agent missed an obvious setup -> FOMO penalty
                 breakdown.fomo_penalty = self.fomo_pen
+
+        # --- Component 12: Exploration Bonus (V3.2) ---
+        # Reward agent for OPENING a trade. Decays with sqrt(trades_today)
+        # to prevent overtrading while still strongly encouraging first trades.
+        if trade_just_opened:
+            decay = 1.0 / math.sqrt(trades_today + 1)
+            breakdown.exploration_bonus = self.exploration_bonus_val * decay
+
+        # --- Component 13: Trade Attempt Shaping (V3.2) ---
+        # Small reward when bot shows trade intention (|confidence| > 0.20)
+        # even if threshold isn't met. Teaches bot to use confidence range.
+        if abs_confidence > 0.20 and not trade_just_opened and not has_open_positions:
+            breakdown.trade_attempt_shaping = self.trade_attempt_bonus
 
         return breakdown
 

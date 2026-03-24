@@ -1,8 +1,8 @@
 """
-Fetch Historical Data v3 — Downloads M1/M5/M15/H1 directly from MT5.
+Fetch Historical Data v3 -- Downloads M1/M5/M15/H1 directly from MT5.
 
-v3.0 — Cognitive Architecture (Intraday):
-    - Fetches ALL 4 TFs directly (no more resampling M5→M15/H1)
+v3.0 -- Cognitive Architecture (Intraday):
+    - Fetches ALL 4 TFs directly (no more resampling M5->M15/H1)
     - M1: 250K bars (~174 days) for deep encoder training
     - M5: 50K bars (~174 days)
     - M15: 17K bars (~174 days)
@@ -14,7 +14,7 @@ v3.0 — Cognitive Architecture (Intraday):
 
 Usage: python scripts/fetch_historical_data.py
 
-⚠ M1 data is LARGE. We fetch in multiple batches to avoid MT5 timeout.
+NOTE: M1 data is LARGE. We fetch in multiple batches to avoid MT5 timeout.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ sys.path.insert(0, str(project_root / "rabit_propfirm_drl"))
 DATA_DIR = project_root / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# ─── Timeframe config ───
+# --- Timeframe config ---
 TF_CONFIG = {
     "M1":  {"bars": 250_000, "batch_size": 50_000},  # Fetch in 50K batches
     "M5":  {"bars":  50_000, "batch_size": 50_000},
@@ -77,7 +77,7 @@ def fetch_bars_batched(mt5, symbol: str, timeframe, total_bars: int, batch_size:
         rates = mt5.copy_rates_from_pos(symbol, timeframe, offset, count)
 
         if rates is None or len(rates) == 0:
-            print(f"    ⚠ No more data at offset {offset} (got {fetched} so far)")
+            print(f"    [!] No more data at offset {offset} (got {fetched} so far)")
             break
 
         times = [datetime.utcfromtimestamp(r[0]) for r in rates]
@@ -96,7 +96,7 @@ def fetch_bars_batched(mt5, symbol: str, timeframe, total_bars: int, batch_size:
         offset += len(rates)
 
         if len(rates) < count:
-            print(f"    ⚠ Fewer bars than requested at offset {offset}")
+            print(f"    [!] Fewer bars than requested at offset {offset}")
             break
 
         # Small delay to avoid hammering MT5
@@ -138,7 +138,7 @@ def build_knowledge_features(ohlcv_np: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     print("=" * 70)
-    print("  RABIT-PROPFIRM — Data Fetch v3.0 (Cognitive Architecture)")
+    print("  RABIT-PROPFIRM -- Data Fetch v3.0 (Cognitive Architecture)")
     print("  Timeframes: M1 / M5 / M15 / H1")
     print("  Features: 28 raw + 22 knowledge = 50-dim per bar")
     print("=" * 70)
@@ -188,7 +188,7 @@ def main() -> None:
         "H1": mt5.TIMEFRAME_H1,
     }
 
-    # ── Step 2: Fetch raw OHLCV for all 4 TFs ──
+    # -- Step 2: Fetch raw OHLCV for all 4 TFs --
     print(f"\n[2/5] Fetching raw OHLCV data...")
     print(f"  Symbols: {symbols}")
     print(f"  TFs: {list(TF_CONFIG.keys())}")
@@ -221,14 +221,14 @@ def main() -> None:
 
             days = (df["time"].max() - df["time"].min()).days
             size_kb = raw_path.stat().st_size / 1024
-            print(f"[OK] {len(df):,} bars ({days}d) → {raw_path.name} ({size_kb:.0f}KB)")
+            print(f"[OK] {len(df):,} bars ({days}d) -> {raw_path.name} ({size_kb:.0f}KB)")
 
     if not raw_data:
         print("\n[X] No data fetched!")
         mt5.shutdown()
         sys.exit(1)
 
-    # ── Step 3: Build 28 raw features per TF ──
+    # -- Step 3: Build 28 raw features per TF --
     print(f"\n[3/5] Building raw SMC + Volume + PA features (28 per TF)...")
 
     features_data: dict[str, dict[str, "pl.DataFrame"]] = {}
@@ -238,7 +238,7 @@ def main() -> None:
         safe_name = sym.replace(".", "_")
 
         for tf_name, df in raw_data[sym].items():
-            # Rename tick_volume → volume if needed
+            # Rename tick_volume -> volume if needed
             if "tick_volume" in df.columns and "volume" not in df.columns:
                 df = df.rename({"tick_volume": "volume"})
 
@@ -247,9 +247,9 @@ def main() -> None:
 
             feat_path = DATA_DIR / f"{safe_name}_{tf_name}_features.parquet"
             feat_df.write_parquet(feat_path)
-            print(f"  {sym} {tf_name}: {len(feat_df):,} rows × {len(feat_df.columns)} cols → {feat_path.name}")
+            print(f"  {sym} {tf_name}: {len(feat_df):,} rows x {len(feat_df.columns)} cols -> {feat_path.name}")
 
-    # ── Step 4: Add Knowledge features (22-dim) → 50-dim total ──
+    # -- Step 4: Add Knowledge features (22-dim) -> 50-dim total --
     print(f"\n[4/5] Adding Knowledge features (22-dim per bar)...")
 
     # Initialize normalizers (one per TF, 50-dim each)
@@ -300,18 +300,18 @@ def main() -> None:
             save_path = DATA_DIR / f"{safe_name}_{tf_name}_50dim.npy"
             np.save(save_path, full_features)
             size_mb = full_features.nbytes / (1024 * 1024)
-            print(f"  {sym} {tf_name}: ({full_features.shape[0]:,} × {full_features.shape[1]}) → {save_path.name} ({size_mb:.1f}MB)")
+            print(f"  {sym} {tf_name}: ({full_features.shape[0]:,} x {full_features.shape[1]}) -> {save_path.name} ({size_mb:.1f}MB)")
 
             # V3: Also save raw OHLCV for env price calculations
             # Trim OHLCV to match feature array length
             ohlcv_trimmed = ohlcv_np[-len(full_features):]
             ohlcv_path = DATA_DIR / f"{safe_name}_{tf_name}_ohlcv.npy"
             np.save(ohlcv_path, ohlcv_trimmed)
-            print(f"    + OHLCV: ({ohlcv_trimmed.shape[0]:,} × {ohlcv_trimmed.shape[1]}) → {ohlcv_path.name}")
+            print(f"    + OHLCV: ({ohlcv_trimmed.shape[0]:,} x {ohlcv_trimmed.shape[1]}) -> {ohlcv_path.name}")
 
         gc.collect()  # Free memory after each symbol
 
-    # ── Step 5: Save normalizer_v3.json ──
+    # -- Step 5: Save normalizer_v3.json --
     print(f"\n[5/5] Saving normalizer_v3.json...")
 
     normalizer_data = {}
@@ -322,7 +322,7 @@ def main() -> None:
     norm_path = DATA_DIR / "normalizer_v3.json"
     with open(norm_path, "w", encoding="utf-8") as f:
         json.dump(normalizer_data, f, indent=2)
-    print(f"  Saved → {norm_path}")
+    print(f"  Saved -> {norm_path}")
 
     # Summary
     print("\n" + "=" * 70)
@@ -341,10 +341,10 @@ def main() -> None:
 
     for f in npy_files:
         arr = np.load(f)
-        print(f"    {f.name:<45} {arr.shape[0]:>8,} × {arr.shape[1]} = {f.stat().st_size / 1024:.0f} KB")
+        print(f"    {f.name:<45} {arr.shape[0]:>8,} x {arr.shape[1]} = {f.stat().st_size / 1024:.0f} KB")
 
     mt5.shutdown()
-    print("\nDone! Ready for train_curriculum.py →")
+    print("\nDone! Ready for train_curriculum.py ->")
 
 
 if __name__ == "__main__":

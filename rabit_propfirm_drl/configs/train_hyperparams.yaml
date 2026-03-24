@@ -44,7 +44,7 @@ curriculum_stage_configs:
   stage_1:
     name: "Stage1_Context"
     description: "Context Recognition: M15+H1 only"
-    total_steps: 200_000
+    total_steps: 750_000           # V3.2: from 200K → 750K (anti mode collapse)
     learning_rate: 1.0e-4
     batch_size: 2048
     n_envs: 32

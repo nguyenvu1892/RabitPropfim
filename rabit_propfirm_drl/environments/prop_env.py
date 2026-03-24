@@ -442,6 +442,8 @@ class MultiTFTradingEnv(gym.Env):
             account_balance=self.balance,
             trade_just_opened=trade_opened,
             trade_just_closed=trade_closed,
+            # V3.2: Pass confidence magnitude for trade_attempt_shaping
+            abs_confidence=abs_conf,
         )
 
         self.prev_unrealized = unrealized

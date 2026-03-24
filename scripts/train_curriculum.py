@@ -113,7 +113,7 @@ STAGES: list[StageConfig] = [
     StageConfig(
         name="Stage1_Context",
         description="Context Recognition: M15+H1 only, learn trend/regime identification",
-        total_steps=200_000,
+        total_steps=750_000,               # V3.2: from 200K → 750K (1.5M params needs more steps)
         learning_rate=1e-4,
         batch_size=2048,           # V3: from 256 → 2048
         n_envs=8,                  # V3: 8 envs (32 caused CPU IPC thrashing)
@@ -125,8 +125,8 @@ STAGES: list[StageConfig] = [
         freeze_entry_cross=True, freeze_struct_cross=False,
         use_episodic_memory=False,
         fixed_sl_tp=True,
-        checkpoint_every=20_000,
-        eval_every=10_000,
+        checkpoint_every=50_000,            # V3.2: from 20K → 50K
+        eval_every=25_000,                  # V3.2: from 10K → 25K
     ),
     StageConfig(
         name="Stage2_Precision",
@@ -302,6 +302,22 @@ def load_data(symbols: list[str], normalizer_path: Path) -> dict:
                 data[sym][ohlcv_key] = None
                 if tf_name == "M5":
                     logger.warning("  V3 OHLCV MISSING: %s (checked: %s)", ohlcv_path.name, ohlcv_path)
+
+    # V3.2: FAIL-FAST data integrity guard
+    # Refuse to train on zero arrays — every required TF must have real data
+    missing_files = []
+    for sym in symbols:
+        safe_name = sym.replace(".", "_")
+        for tf_name in ["M1", "M5", "M15", "H1"]:
+            if data[sym].get(tf_name) is None:
+                missing_files.append(f"{safe_name}_{tf_name}_50dim.npy")
+    if missing_files:
+        raise FileNotFoundError(
+            f"V3.2 FAIL-FAST: {len(missing_files)} critical data files missing!\n"
+            f"Missing: {missing_files}\n"
+            f"Run 'python scripts/fetch_historical_data.py' to generate all data files.\n"
+            f"NEVER train on zero arrays — this causes mode collapse."
+        )
 
     return {"data": data, "normalizers": normalizers}
 

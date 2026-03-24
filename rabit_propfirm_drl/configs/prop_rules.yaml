@@ -24,7 +24,7 @@ rr_bonus_threshold: 1.5         # Minimum RR ratio for bonus
 rr_bonus_coefficient: 0.3       # Bonus multiplier for good RR
 overtrading_penalty: -0.5       # Per-trade penalty when exceeding max
 inaction_nudge: -0.5            # Strong penalty for excessive inaction (was -0.01)
-inaction_threshold_steps: 500   # Steps before inaction penalty kicks in
+inaction_threshold_steps: 100   # V3.2: from 500 → 100 (kick in much earlier)
 
 # Drawdown Penalty (Exponential)
 dd_penalty_alpha: 2.0           # Penalty base coefficient
@@ -44,6 +44,11 @@ sniper_loss_multiplier: 3.0     # Sniper M1 loss penalty multiplier (vs 1.0 for 
 fomo_penalty: -5.0              # Penalty for missing obvious M1 setup
 fomo_lookahead_steps: 50        # Bars to look ahead for oracle
 fomo_move_threshold_pct: 0.005  # 0.5% price move = "obvious setup"
+
+# ─── V3.2: Anti-Mode-Collapse Reward Shaping ───
+exploration_bonus: 0.5          # Reward for opening a trade (decays with sqrt(trades))
+trade_attempt_bonus: 0.05       # Small reward when |confidence| > 0.20 (intent to trade)
+loss_dampening_factor: 0.5      # Scale realized losses to 50% (make trading < scary than HOLD)
 
 # ─── Strict Risk Management ───
 max_loss_per_trade_pct: 0.003    # 0.3% max loss per single trade
