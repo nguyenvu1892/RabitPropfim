@@ -11,6 +11,16 @@
 - **Tự tiến hóa** — Qua hệ thống Self-Imitation Learning (Rương Vàng), bot tự nhặt ra lệnh chuẩn bài để học lại, liên tục nâng cấp tư duy giao dịch
 - **Kỷ luật thép Prop Firm** — Tuân thủ tuyệt đối ngưỡng rủi ro: max 0.3% loss/trade, 5% daily DD, 10% total DD
 
+### Chiến lược Khung Thời Gian (Multi-Timeframe)
+| Khung TF | Vai trò | Mô tả |
+|----------|---------|-------|
+| **H1** | 🔭 Xác định xu hướng lớn | Nhìn cấu trúc thị trường (BOS/CHoCH), xác định trend chính |
+| **M15** | 🗺️ Xác định vùng cản/OB | Tìm Order Block, Fair Value Gap, vùng supply/demand |
+| **M5** | 🎯 Entry chính | Điểm vào lệnh tiêu chuẩn — khi có hợp lưu H1+M15 |
+| **M1** | 🔫 Sniper Entry | Chỉ vào lệnh khi **xác suất win > 70%** — Volume nổ + Pin Action chuẩn |
+
+> **Nguyên tắc:** M1 Sniper là vũ khí tối thượng nhưng chỉ bóp cò khi xác suất thắng vượt 70%. Còn lại dùng M5 entry bình thường.
+
 ### Mục tiêu cụ thể
 1. **Pass Prop Firm Challenge** — Đạt 10% lợi nhuận trong 30 ngày, giữ drawdown trong giới hạn
 2. **Bot tự giao dịch 100%** — Từ phân tích → Entry → Quản trị rủi ro → Exit, hoàn toàn tự động
