@@ -1,16 +1,21 @@
 # 🐰 RabitPropfim — DRL Trading Bot cho Prop Firm
 
-> **Mục tiêu cuối cùng:** Xây dựng bot giao dịch AI sử dụng Deep Reinforcement Learning (DRL) để vượt qua thử thách Prop Firm (FTMO, TopStep...) với WR ≥ 50%, MaxDD < 5%, Sharpe > 2.0.
+> **Tầm nhìn:** Tạo ra một BOT AI có khả năng **tự suy nghĩ, tự tiến hóa** dựa vào các kiến thức được nạp vào (SMC + Volume + Pin Action). Bot được thiết kế để giao dịch các quỹ Prop Firm, với nguyên tắc sắt: **mỗi lệnh không được thua quá 0.3% tài khoản.**
 
 ---
 
 ## 📋 Mục Tiêu Dự Án
 
-### Mục tiêu chính
-1. **Pass Prop Firm Challenge** — Đạt 10% lợi nhuận trong 30 ngày, giữ drawdown < 5% daily / 10% total
+### Tầm nhìn cốt lõi
+- **Bot AI tự suy nghĩ** — Học cách đọc thị trường thông qua SMC (Smart Money Concepts), Volume Profile, và Pin Action thay vì dùng indicator truyền thống
+- **Tự tiến hóa** — Qua hệ thống Self-Imitation Learning (Rương Vàng), bot tự nhặt ra lệnh chuẩn bài để học lại, liên tục nâng cấp tư duy giao dịch
+- **Kỷ luật thép Prop Firm** — Tuân thủ tuyệt đối ngưỡng rủi ro: max 0.3% loss/trade, 5% daily DD, 10% total DD
+
+### Mục tiêu cụ thể
+1. **Pass Prop Firm Challenge** — Đạt 10% lợi nhuận trong 30 ngày, giữ drawdown trong giới hạn
 2. **Bot tự giao dịch 100%** — Từ phân tích → Entry → Quản trị rủi ro → Exit, hoàn toàn tự động
 3. **Đa cặp tiền** — XAUUSD, BTCUSD, ETHUSD, US30, US100 (5 symbols)
-4. **Kết nối MT5 live** — Qua FTMO Demo → Real account
+4. **Kết nối MT5 live** — Giao dịch trực tiếp trên tài khoản FTMO
 
 ### Chỉ tiêu kỹ thuật
 | Metric | Target | V3.4 S1 Best |
