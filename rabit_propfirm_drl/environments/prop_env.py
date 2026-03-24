@@ -1,13 +1,14 @@
 """
 PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-V3.3 -- "Ruong Vang" Architecture:
-    - Discrete action space: BUY=0, SELL=1, HOLD=2
-    - Frame Stacking: M5 (1 bar, 50-dim) + M1 (5 bars, 250-dim) = 300-dim flat obs
+V3.4 -- "Quan Tri Rui Ro" Architecture:
+    - Discrete action space: BUY=0, SELL=1, HOLD=2, CLOSE=3
+    - 3-TF Frame Stacking: M15 (1 bar, 50) + M5 (1 bar, 50) + M1 (5 bars, 250) = 350-dim
     - ATR Normalization: price features scaled by rolling ATR
-    - No confidence gate -- every BUY/SELL immediately executes
-    - Fixed lot (0.01), fixed SL (1.5x ATR), fixed TP (2.0x ATR)
-    - action_mode param: "discrete" (Stage 1) or "continuous" (Stage 2+)
+    - Auto SL from M5 Swing Points (no fixed SL/TP)
+    - Bot actively manages exits via CLOSE action
+    - Fixed lot (0.01), SL at Swing Low/High, NO fixed TP
+    - action_mode param: "discrete" (V3.4) or "continuous" (legacy)
 """
 
 from __future__ import annotations
@@ -47,12 +48,12 @@ class MultiTFTradingEnv(gym.Env):
     """
     Multi-Timeframe Trading Environment.
 
-    V3.3 supports two action modes:
-        - "discrete": Discrete(3) BUY/SELL/HOLD for Stage 1
-        - "continuous": Box(5,) for Stage 2+ (legacy)
+    V3.4 supports two action modes:
+        - "discrete": Discrete(4) BUY/SELL/HOLD/CLOSE
+        - "continuous": Box(5,) (legacy)
 
-    Observation (V3.3 discrete mode):
-        Flat Box(300,) = 1 M5 bar (50-dim) + 5 M1 bars (5 x 50 = 250-dim)
+    Observation (V3.4 discrete mode):
+        Flat Box(350,) = 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -141,10 +142,11 @@ class MultiTFTradingEnv(gym.Env):
         self.trading_start = config.get("trading_start_utc", 1)
         self.trading_end = config.get("trading_end_utc", 22)
 
-        # V3.3 Stage 1: Fixed trade parameters (no learning needed)
+        # V3.4: Fixed lot only. SL from swing points, no fixed TP.
         self.fixed_lot = config.get("stage1_fixed_lot", 0.01)
-        self.fixed_sl_mult = config.get("stage1_sl_mult", 1.5)
-        self.fixed_tp_mult = config.get("stage1_tp_mult", 2.0)
+        self.swing_lookback = config.get("swing_lookback", 20)
+        self.sl_buffer_mult = config.get("sl_buffer_mult", 0.1)  # Buffer beyond swing
+        self.sl_fallback_mult = config.get("sl_fallback_mult", 2.0)  # Fallback if no swing
 
         # Legacy thresholds (continuous mode only)
         self.confidence_threshold = config.get("confidence_threshold", 0.15)
@@ -157,12 +159,12 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- Spaces ---
         if self.action_mode == "discrete":
-            # V3.3: BUY=0, SELL=1, HOLD=2
-            self.action_space = spaces.Discrete(3)
-            # Flat obs: 1 M5 bar (50) + 5 M1 bars (250) = 300-dim
+            # V3.4: BUY=0, SELL=1, HOLD=2, CLOSE=3
+            self.action_space = spaces.Discrete(4)
+            # Flat obs: 1 M15 (50) + 1 M5 (50) + 5 M1 (250) = 350-dim
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(300,),
+                shape=(350,),
                 dtype=np.float32,
             )
         else:
@@ -254,7 +256,7 @@ class MultiTFTradingEnv(gym.Env):
         Execute one M5 time step.
 
         Args:
-            action: int (discrete mode: 0=BUY, 1=SELL, 2=HOLD)
+            action: int (discrete mode: 0=BUY, 1=SELL, 2=HOLD, 3=CLOSE)
                     or np.ndarray (continuous mode)
         """
         self.current_m5_step += 1
@@ -268,20 +270,71 @@ class MultiTFTradingEnv(gym.Env):
         else:
             return self._step_continuous(action, price, hour_utc)
 
-    def _step_discrete(self, action: int, price: float, hour_utc: int) -> tuple:
-        """V3.3 Stage 1: Discrete BUY/SELL/HOLD step."""
-        # action: 0=BUY, 1=SELL, 2=HOLD
+    def _find_swing_sl(self, direction: int, m5_idx: int, entry_price: float) -> float:
+        """
+        V3.4: Find SL from M5 swing points.
 
-        # --- Check existing positions (SL/TP hits) ---
+        BUY  -> SL = recent Swing Low  - buffer
+        SELL -> SL = recent Swing High + buffer
+
+        Swing Low  = bar where low < low of bars on both sides
+        Swing High = bar where high > high of bars on both sides
+        """
+        lookback = self.swing_lookback
+        start_idx = max(1, m5_idx - lookback)
+        atr = float(self.atr_array[min(m5_idx, len(self.atr_array) - 1)])
+        buffer = atr * self.sl_buffer_mult
+
+        if direction > 0:  # BUY → find Swing Low
+            best_swing = None
+            for i in range(m5_idx - 1, start_idx, -1):
+                if i < 1 or i >= len(self.ohlcv_m5) - 1:
+                    continue
+                low_i = float(self.ohlcv_m5[i, 2])
+                low_prev = float(self.ohlcv_m5[i - 1, 2])
+                low_next = float(self.ohlcv_m5[i + 1, 2])
+                if low_i < low_prev and low_i < low_next:
+                    # Valid swing low, must be below entry
+                    if low_i < entry_price:
+                        best_swing = low_i
+                        break
+            if best_swing is not None:
+                return best_swing - buffer
+            else:
+                # Fallback: ATR-based
+                return entry_price - atr * self.sl_fallback_mult
+
+        else:  # SELL → find Swing High
+            best_swing = None
+            for i in range(m5_idx - 1, start_idx, -1):
+                if i < 1 or i >= len(self.ohlcv_m5) - 1:
+                    continue
+                high_i = float(self.ohlcv_m5[i, 1])
+                high_prev = float(self.ohlcv_m5[i - 1, 1])
+                high_next = float(self.ohlcv_m5[i + 1, 1])
+                if high_i > high_prev and high_i > high_next:
+                    if high_i > entry_price:
+                        best_swing = high_i
+                        break
+            if best_swing is not None:
+                return best_swing + buffer
+            else:
+                return entry_price + atr * self.sl_fallback_mult
+
+    def _step_discrete(self, action: int, price: float, hour_utc: int) -> tuple:
+        """V3.4: Discrete BUY/SELL/HOLD/CLOSE step."""
+        # action: 0=BUY, 1=SELL, 2=HOLD, 3=CLOSE
+
+        # --- Check existing positions (SL only, no TP) ---
         realized_pnl = 0.0
-        rr_ratio = 0.0
         trade_closed = False
+        manual_close = False
+        manual_close_pnl = 0.0
 
         for pos in list(self.positions):
-            hit, pnl, rr = self._check_sl_tp(pos, price)
+            hit, pnl = self._check_sl_only(pos, price)
             if hit:
                 realized_pnl += pnl
-                rr_ratio = max(rr_ratio, rr)
                 trade_closed = True
                 self.balance += pnl
                 self.positions.remove(pos)
@@ -290,6 +343,7 @@ class MultiTFTradingEnv(gym.Env):
                     "entry": pos.entry_price, "exit": price,
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
+                    "close_reason": "SL_HIT",
                 })
 
         # --- Session close ---
@@ -308,7 +362,25 @@ class MultiTFTradingEnv(gym.Env):
                 })
             self.positions.clear()
 
-        # --- Execute action (NO gate, direct execution) ---
+        # --- CLOSE action (V3.4) ---
+        if action == 3 and self.positions:
+            for pos in list(self.positions):
+                pnl = self._calc_position_pnl(pos, price)
+                manual_close_pnl += pnl
+                realized_pnl += pnl
+                trade_closed = True
+                manual_close = True
+                self.balance += pnl
+                self.trade_history.append({
+                    "ticket": pos.ticket, "direction": pos.direction,
+                    "entry": pos.entry_price, "exit": price,
+                    "pnl": pnl, "lots": pos.lots,
+                    "duration": self.current_m5_step - pos.entry_step,
+                    "close_reason": "MANUAL_CLOSE",
+                })
+            self.positions.clear()
+
+        # --- Execute BUY/SELL ---
         trade_opened = False
         spread_cost = 0.0
 
@@ -320,9 +392,6 @@ class MultiTFTradingEnv(gym.Env):
                 and self.trading_start <= hour_utc < self.trading_end
             ):
                 lot_size = self.fixed_lot
-                atr_pips = self._estimate_atr_pips(price)
-                sl_pips = atr_pips * self.fixed_sl_mult
-                tp_pips = atr_pips * self.fixed_tp_mult
 
                 exec_result = self.physics.execute_order(
                     price=price,
@@ -333,12 +402,11 @@ class MultiTFTradingEnv(gym.Env):
                 )
 
                 if exec_result.filled:
-                    if direction > 0:  # BUY
-                        sl_price = exec_result.fill_price - sl_pips * self.pip_value
-                        tp_price = exec_result.fill_price + tp_pips * self.pip_value
-                    else:  # SELL
-                        sl_price = exec_result.fill_price + sl_pips * self.pip_value
-                        tp_price = exec_result.fill_price - tp_pips * self.pip_value
+                    # V3.4: Auto SL from swing points, NO TP
+                    sl_price = self._find_swing_sl(
+                        direction, self.current_m5_step, exec_result.fill_price
+                    )
+                    tp_price = 0.0  # No fixed TP — bot uses CLOSE
 
                     commission = self.commission_per_lot * exec_result.fill_lots
                     self.balance -= commission
@@ -380,6 +448,8 @@ class MultiTFTradingEnv(gym.Env):
             trade_just_opened=trade_opened,
             trade_just_closed=trade_closed,
             hour_utc=hour_utc,
+            manual_close=manual_close,
+            manual_close_pnl=manual_close_pnl,
         )
 
         self.prev_unrealized = unrealized
@@ -579,25 +649,28 @@ class MultiTFTradingEnv(gym.Env):
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.3: Flat 300-dim observation.
-        = 1 M5 bar (50-dim) + 5 M1 bars (5 x 50 = 250-dim)
+        V3.4: Flat 350-dim observation.
+        = 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
 
-        All features normalized by ATR where applicable.
+        M15: trend context | M5: structure/OB | M1: entry precision
+        All features normalized by ATR.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # M5: current bar (50-dim)
+        # M15: current bar (50-dim) — trend context
+        m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
+        m15_bar = self.data_m15[m15_idx].copy()
+        m15_bar[:10] = m15_bar[:10] / atr
+
+        # M5: current bar (50-dim) — structure/OB
         m5_bar = self.data_m5[m5_idx].copy()
-        # Normalize price-based features (first ~10 columns are price-derived)
         m5_bar[:10] = m5_bar[:10] / atr
 
-        # M1: last 5 bars
+        # M1: last 5 bars (250-dim) — entry precision
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
         m1_window = self.data_m1[m1_start_idx:m1_end_idx + 1].copy()
-
-        # Normalize M1 features by ATR
         m1_window[:, :10] = m1_window[:, :10] / atr
 
         # Zero-pad if fewer than 5 M1 bars
@@ -605,8 +678,8 @@ class MultiTFTradingEnv(gym.Env):
             pad = np.zeros((5 - len(m1_window), self.n_features), dtype=np.float32)
             m1_window = np.vstack([pad, m1_window])
 
-        # Flatten: M5 (50) + M1 (250) = 300
-        obs = np.concatenate([m5_bar, m1_window.flatten()]).astype(np.float32)
+        # Flatten: M15 (50) + M5 (50) + M1 (250) = 350
+        obs = np.concatenate([m15_bar, m5_bar, m1_window.flatten()]).astype(np.float32)
 
         # Clip to prevent extreme values
         obs = np.clip(obs, -10.0, 10.0)
@@ -675,31 +748,19 @@ class MultiTFTradingEnv(gym.Env):
         price_diff = (current_price - pos.entry_price) * pos.direction
         return price_diff * pos.lots * self.lot_value
 
-    def _check_sl_tp(
+    def _check_sl_only(
         self, pos: Position, current_price: float,
-    ) -> tuple[bool, float, float]:
+    ) -> tuple[bool, float]:
+        """V3.4: Check SL only. No TP — bot uses CLOSE action."""
         if pos.direction > 0:  # LONG
             if current_price <= pos.sl_price:
                 pnl = (pos.sl_price - pos.entry_price) * pos.lots * self.lot_value
-                return True, pnl, 0.0
-            if current_price >= pos.tp_price:
-                pnl = (pos.tp_price - pos.entry_price) * pos.lots * self.lot_value
-                risk = abs(pos.entry_price - pos.sl_price)
-                reward = abs(pos.tp_price - pos.entry_price)
-                rr = reward / max(risk, 1e-10)
-                return True, pnl, rr
+                return True, pnl
         else:  # SHORT
             if current_price >= pos.sl_price:
                 pnl = (pos.entry_price - pos.sl_price) * pos.lots * self.lot_value
-                return True, pnl, 0.0
-            if current_price <= pos.tp_price:
-                pnl = (pos.entry_price - pos.tp_price) * pos.lots * self.lot_value
-                risk = abs(pos.sl_price - pos.entry_price)
-                reward = abs(pos.entry_price - pos.tp_price)
-                rr = reward / max(risk, 1e-10)
-                return True, pnl, rr
-
-        return False, 0.0, 0.0
+                return True, pnl
+        return False, 0.0
 
     def _get_info(self) -> dict[str, Any]:
         return {

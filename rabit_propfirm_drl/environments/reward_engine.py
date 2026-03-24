@@ -1,13 +1,12 @@
 """
 Reward Engine -- Multi-component reward function for DRL trading agent.
 
-V3.3 -- Simplified Stage 1 (anti-mode-collapse):
- 1. trade_bonus    -- +1.0 per trade opened (win or lose)
- 2. realized_pnl   -- Actual PnL scaled by ATR (not raw dollars)
- 3. inaction_nudge  -- -0.1 per step idle (gentle nudge)
+V3.4 -- "Quan Tri Rui Ro" Reward:
+ 1. realized_pnl   -- Actual PnL scaled by balance (win or lose)
+ 2. close_profit_bonus -- x5 multiplier when bot manually CLOSEs a winning trade
 
-All penalties (DD, overnight, overtrading, fomo, sniper) DISABLED for Stage 1.
-Can be re-enabled for Stage 2+ via config `stage1_mode: false`.
+All frequency pressure (inaction_nudge, trade_bonus) REMOVED.
+Bot is rewarded purely for quality P&L and smart exits.
 """
 
 from __future__ import annotations
@@ -118,10 +117,10 @@ class RewardEngine:
         self.fomo_lookahead = config.get("fomo_lookahead_steps", 50)
         self.fomo_move_pct = config.get("fomo_move_threshold_pct", 0.005)
 
-        # V3.3: Trade bonus (replaces exploration_bonus)
-        self.trade_bonus_val = config.get("trade_bonus", 1.0)
+        # V3.4: Close profit multiplier (reward for smart manual close)
+        self.close_profit_mult = config.get("close_profit_multiplier", 5.0)
 
-        # V3.2 compat
+        # V3.3 compat
         self.exploration_bonus_val = config.get("exploration_bonus", 0.5)
         self.trade_attempt_bonus = config.get("trade_attempt_bonus", 0.05)
         self.loss_dampening = config.get("loss_dampening_factor", 0.5)
@@ -147,8 +146,10 @@ class RewardEngine:
         future_price_data: Optional[np.ndarray] = None,
         current_price: float = 0.0,
         abs_confidence: float = 0.0,
+        manual_close: bool = False,
+        manual_close_pnl: float = 0.0,
     ) -> RewardBreakdown:
-        """Calculate reward components. Stage1 mode uses only 3 components."""
+        """Calculate reward components. Stage1 mode uses V3.4 simplified reward."""
         breakdown = RewardBreakdown()
 
         if self.stage1_mode:
@@ -156,7 +157,7 @@ class RewardEngine:
                 breakdown, realized_pnl, account_balance,
                 trade_just_opened, trade_just_closed,
                 steps_since_last_trade, has_open_positions,
-                trades_today,
+                trades_today, manual_close, manual_close_pnl,
             )
         else:
             return self._calculate_full(
@@ -179,25 +180,28 @@ class RewardEngine:
         steps_since_last_trade: int,
         has_open_positions: bool,
         trades_today: int,
+        manual_close: bool = False,
+        manual_close_pnl: float = 0.0,
     ) -> RewardBreakdown:
         """
-        V3.3 Stage 1: Only 3 reward components.
-        Goal: Make the bot TRADE, not sit idle.
+        V3.4: Only 2 reward components.
+        Goal: Quality P&L + smart manual closes.
+        No pressure to trade — bot trades when it sees value.
         """
         balance_norm = max(account_balance, 1.0)
 
-        # Component 1: Trade Bonus (+1.0 per trade opened)
-        if trade_just_opened:
-            decay = 1.0 / math.sqrt(trades_today + 1)  # Gentle decay
-            breakdown.exploration_bonus = self.trade_bonus_val * decay
-
-        # Component 2: Realized PnL (simplified, no sniper/dampening)
+        # Component 1: Realized PnL (all trade closures)
         if trade_just_closed and realized_pnl != 0:
             breakdown.realized_pnl = realized_pnl / balance_norm * 100
 
-        # Component 3: Inaction Nudge (gentle but persistent)
-        if steps_since_last_trade > self.inaction_threshold and not has_open_positions:
-            breakdown.inaction_nudge = self.inaction_pen
+        # Component 2: CLOSE Profit Bonus (x5 for profitable manual close)
+        if manual_close and manual_close_pnl > 0:
+            # Extra reward for actively taking profit
+            breakdown.exploration_bonus = (
+                manual_close_pnl / balance_norm * 100 * (self.close_profit_mult - 1.0)
+            )
+
+        # NO inaction_nudge, NO trade_bonus — purely quality-driven
 
         return breakdown
 
