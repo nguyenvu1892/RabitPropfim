@@ -4,6 +4,133 @@
 
 ---
 
+## 25/03/2026
+
+### [MAJOR] V3.6 — "Tự Vấn" (Self-Reflection) — AttentionPPO + Contrastive Learning — 25/03 01:50
+- **Commits:** `c4ff8dc`, `dc61ae5` on `main`
+- **Tư duy mới:** Bỏ hẳn Imitation Learning (copy lệnh). Bot phải TỰ SO SÁNH WIN vs LOSS.
+
+#### 1. Kiến trúc AttentionPPO (thay thế MLP)
+- **Trước (V3.5):** MLP trunk 512→256→128 = 372K params
+- **Sau (V3.6):** Self-Attention 8 tokens × 50-dim → Transformer 2L 4H d_model=64 = **120K params** (3.1× nhẹ hơn)
+- Tokens: `[H1] [M15] [M5] [M1_b1] [M1_b2] [M1_b3] [M1_b4] [M1_b5]`
+- 3 output heads: Actor (4 actions), Critic (value), **Contrastive** (128-dim embedding)
+- Manual attention weight capture → xuất Attention Heatmap 8×8 cho phân tích
+
+#### 2. Contrastive Memory (thay thế VIP Buffer + IL)
+- Lưu cả WIN lẫn LOSS trades (per-symbol, per-regime)
+- InfoNCE Loss: ép embedding WIN xa embedding LOSS
+- Không copy mù → bot học PHÂN BIỆT bản chất WIN/LOSS
+
+#### 3. Kết quả Stage 1 (750K steps, 719s)
+| Symbol | Trades | WR | MC WR | Actions |
+|--------|--------|----|-------|---------|
+| XAUUSD | 7,564 | 48.2% | 59.6% | B=24% S=25% H=23% C=28% |
+| BTCUSD | 7,337 | 47.5% | 59.1% | Balanced |
+| ETHUSD | 7,612 | 47.6% | 59.4% | Balanced |
+| US30 | 7,709 | 47.4% | 58.1% | Balanced |
+| US100 | 7,458 | 47.8% | 58.8% | Balanced |
+| **TỔNG** | **37,680** | **47.7%** | **59.0%** | **Cân bằng nhất** |
+
+#### 4. Attention Heatmap
+```
+H1     |  31.4%  ← Bot tự học H1 quan trọng nhất (3× so với token khác)
+M15    |  10.7%
+M5     |  10.7%
+M1_b2  |  12.1%  ← Entry bar nhận attention cao nhất trong M1
+M1_b1  |   9.0%
+```
+
+#### Files mới/thay đổi:
+| File | Thay đổi |
+|------|----------|
+| `models/attention_ppo.py` | [NEW] AttentionPPO: 8-token Self-Attention + 3 heads |
+| `training_pipeline/contrastive_memory.py` | [NEW] WIN/LOSS storage + InfoNCE contrastive loss |
+| `scripts/train_v36.py` | [NEW] PPO + Contrastive training pipeline |
+| `scripts/backtest_v36.py` | [NEW] Backtest + Attention Heatmap analysis |
+
+---
+
+### [SERVER] Server cũ mất — Chuyển server mới — 25/03 09:30
+- Server RTX 4090 (`38.224.253.180`) bị mất
+- Toàn bộ models trained (best_v34/v35/v36_stage1.pt) cần train lại
+- Code đã push đầy đủ lên GitHub, sẵn sàng clone xuống server mới
+- **Checkpoint cần train lại:** V3.6 Stage 1 (750K steps, ~12 phút trên RTX 4090)
+
+---
+
+## 24/03/2026
+
+### [MAJOR] V3.5 — "4-TF Hợp Thể" — Thêm H1 vào Observation — 24/03 23:45
+- **Commits:** `1f98e68`, `c3d99b7` on `main`
+
+#### Thay đổi:
+- **Observation:** 350-dim (M15+M5+M1) → **400-dim (H1+M15+M5+M1)**
+- `_get_obs_discrete()`: thêm H1 bar (50-dim) đầu vector
+- `train_v35.py`: PPO obs_dim=400, actions=4
+
+#### Kết quả Stage 1:
+| Metric | V3.4 | **V3.5** |
+|--------|------|---------|
+| WR | 49.0% | **50.2%** ← VƯỢT 50% LẦN ĐẦU |
+| Trades | 2,277 | 5,557 |
+| SL Rate | 19.2% | **17.7%** |
+
+#### Kết quả Stage 2 (PPO + IL, 735 VIP strict 147/sym):
+- WR = 31.1% ❌ (SELL bias 68-96%)
+- **Kết luận:** IL (Imitation Learning) bị lỗi cấu trúc — VIP data toàn SELL → bot học copy mù
+
+#### Files mới:
+| File | Thay đổi |
+|------|----------|
+| `prop_env.py` | V3.5: 400-dim obs, thêm H1 bar |
+| `scripts/train_v35.py` | [NEW] PPO obs=400 |
+| `scripts/harvest_vip_v35.py` | [NEW] VIP harvest strict equal cap |
+| `scripts/backtest_v35.py` | [NEW] V3.5 backtest |
+
+---
+
+### [MAJOR] V3.4 — "Quản Trị Rủi Ro" — Discrete(4) + Auto SL + CLOSE — 24/03 15:00
+- **Commits:** `3eb1103`, `e6b6f11` on `main`
+- **Đập đi xây lại** `prop_env.py` và `reward_engine.py`
+
+#### 1. Action Space mới: Discrete(4)
+- **Trước (V3.3):** Discrete(3) BUY/SELL/HOLD
+- **Sau (V3.4):** Discrete(4) BUY/SELL/HOLD/**CLOSE** ← bot tự chốt lời
+
+#### 2. Auto SL (Swing Point)
+- Bỏ SL cố định (x1.5/x2 ATR)
+- **Mới:** Quét M5 tìm Swing Low/High gần nhất → SL tự động theo cấu trúc
+- Fallback: x2 ATR nếu không tìm được swing
+
+#### 3. CLOSE Action
+- Reward x5 khi bot tự tay bấm CLOSE và lệnh đang lãi
+- Dạy bot "gồng lời" → biết khi nào chốt
+
+#### 4. Observation V3.4: 350-dim
+- M15 (1 bar, 50) + M5 (1 bar, 50) + M1 (5 bars, 250)
+- ATR normalization cho price features
+
+#### Kết quả:
+- **Stage 1:** WR=49.0%, 2,277 trades, CLOSE rất tích cực
+- **Stage 2 (PPO+IL):** WR giảm do SELL bias từ VIP data
+- **Stage 3:** WR=38.3%, Manual Close WR=63.5%
+
+#### Files thay đổi:
+| File | Thay đổi |
+|------|----------|
+| `prop_env.py` | V3.4: Discrete(4), Auto SL, 350-dim obs |
+| `reward_engine.py` | V3.4: CLOSE profit x5, bỏ frequency rewards |
+| `prop_rules.yaml` | Thêm swing_lookback, sl_buffer_mult, close_profit_multiplier |
+| `scripts/train_v34.py` | [NEW] PPO Discrete(4) training |
+| `scripts/harvest_vip_v34.py` | [NEW] VIP harvest with SMC filter |
+
+### [DOC] README.md — Tài liệu hoá dự án — 24/03 22:00
+- **Commits:** `c80a493`, `babfb90`, `6aa5d83` on `main`
+- Viết README.md hoàn chỉnh: Vision, Knowledge Base (50-dim features), Quy tắc rủi ro, Nightly Auto-Retrain, lộ trình V3.5→V4.0
+
+---
+
 ## 23/03/2026
 
 ### [MAJOR] V3 Core Fixes — Blind Price Bug + GPU Optimization + Stage-Gate — 23/03/2026 23:27
