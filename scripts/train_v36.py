@@ -164,6 +164,7 @@ def train_stage1(
     logger.info("AsyncVectorEnv: %d envs, obs=%s", n_envs, obs_batch.shape)
 
     model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
+    model.token_dropout_enabled = True  # V3.7.1: Token Dropout ON for S1
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
     memory = ContrastiveMemory(max_per_symbol=500)
@@ -390,6 +391,7 @@ def train_stage2(
         logger.warning("No S1 checkpoint found, starting from scratch!")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    model.token_dropout_enabled = False  # V3.7.1: Token Dropout OFF for S2 (CL needs full context)
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
 
     # --- LOAD Contrastive Memory from disk ---
@@ -611,6 +613,7 @@ def train_stage3(
 
     # Lower LR for fine-tuning
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    model.token_dropout_enabled = True  # V3.7.1: Token Dropout ON for S3
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
 
     # --- LOAD Contrastive Memory (tiny anchor) ---
