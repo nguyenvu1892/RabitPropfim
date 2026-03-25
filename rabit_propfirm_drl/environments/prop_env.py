@@ -1,14 +1,15 @@
 """
 PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-V3.5 -- "4-TF Hop The" Architecture:
+V3.6.1 -- "Tot Nghiep" Architecture:
     - Discrete action space: BUY=0, SELL=1, HOLD=2, CLOSE=3
-    - 4-TF Frame Stacking: H1 (1 bar, 50) + M15 (1 bar, 50) + M5 (1 bar, 50) + M1 (5 bars, 250) = 400-dim
+    - 4-TF Frame Stacking: H1 (1 bar, 52) + M15 (1 bar, 52) + M5 (1 bar, 52) + M1 (5 bars, 260) = 416-dim
+    - +2 features per bar: OB proximity (distance to Order Block) + Volume spike
     - ATR Normalization: price features scaled by rolling ATR
     - Auto SL from M5 Swing Points (no fixed SL/TP)
     - Bot actively manages exits via CLOSE action
     - Fixed lot (0.01), SL at Swing Low/High, NO fixed TP
-    - action_mode param: "discrete" (V3.5) or "continuous" (legacy)
+    - action_mode param: "discrete" (V3.6.1) or "continuous" (legacy)
 """
 
 from __future__ import annotations
@@ -52,8 +53,9 @@ class MultiTFTradingEnv(gym.Env):
         - "discrete": Discrete(4) BUY/SELL/HOLD/CLOSE
         - "continuous": Box(5,) (legacy)
 
-    Observation (V3.5 discrete mode):
-        Flat Box(400,) = 1 H1 bar (50) + 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
+    Observation (V3.6.1 discrete mode):
+        Flat Box(416,) = 1 H1 bar (52) + 1 M15 bar (52) + 1 M5 bar (52) + 5 M1 bars (260)
+        +2 features per bar: OB proximity + Volume spike
     """
 
     metadata = {"render_modes": ["human"]}
@@ -159,12 +161,12 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- Spaces ---
         if self.action_mode == "discrete":
-            # V3.5: BUY=0, SELL=1, HOLD=2, CLOSE=3
+            # V3.6.1: BUY=0, SELL=1, HOLD=2, CLOSE=3
             self.action_space = spaces.Discrete(4)
-            # Flat obs: 1 H1 (50) + 1 M15 (50) + 1 M5 (50) + 5 M1 (250) = 400-dim
+            # Flat obs: 1 H1 (52) + 1 M15 (52) + 1 M5 (52) + 5 M1 (260) = 416-dim
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(400,),
+                shape=(416,),
                 dtype=np.float32,
             )
         else:
@@ -647,44 +649,89 @@ class MultiTFTradingEnv(gym.Env):
         else:
             return self._get_obs_continuous()
 
+    def _compute_ob_proximity(self, data: np.ndarray, bar_idx: int, lookback: int = 20) -> float:
+        """
+        Compute distance (in bars, 0-1 scaled) from current bar to nearest Order Block.
+        OB columns: order_block_bull=35, order_block_bear=36 in 50-dim features.
+        Returns 0.0 if OB is at current bar, 1.0 if no OB found within lookback.
+        """
+        ob_bull_col = min(35, data.shape[1] - 1)
+        ob_bear_col = min(36, data.shape[1] - 1)
+        start = max(0, bar_idx - lookback)
+        for dist in range(0, bar_idx - start + 1):
+            idx = bar_idx - dist
+            if idx < 0 or idx >= len(data):
+                continue
+            if data[idx, ob_bull_col] > 0.5 or data[idx, ob_bear_col] > 0.5:
+                return float(dist) / max(lookback, 1)  # 0.0 = at OB, 1.0 = far
+        return 1.0  # No OB found
+
+    def _compute_volume_spike(self, data: np.ndarray, bar_idx: int, threshold: float = 2.0) -> float:
+        """
+        Detect volume spike: volume_ratio (col 20) > threshold.
+        Returns spike magnitude (0.0 if no spike, capped at 1.0).
+        """
+        vol_ratio_col = min(20, data.shape[1] - 1)
+        if bar_idx < 0 or bar_idx >= len(data):
+            return 0.0
+        vol_ratio = float(data[bar_idx, vol_ratio_col])
+        if vol_ratio > threshold:
+            return min((vol_ratio - threshold) / threshold, 1.0)
+        return 0.0
+
+    def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int) -> np.ndarray:
+        """Append OB proximity + Volume spike to a bar (50→52)."""
+        ob_prox = self._compute_ob_proximity(data, bar_idx)
+        vol_spike = self._compute_volume_spike(data, bar_idx)
+        return np.append(bar, [ob_prox, vol_spike]).astype(np.float32)
+
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.5: Flat 400-dim observation.
-        = 1 H1 bar (50) + 1 M15 bar (50) + 1 M5 bar (50) + 5 M1 bars (250)
+        V3.6.1: Flat 416-dim observation.
+        = 1 H1 bar (52) + 1 M15 bar (52) + 1 M5 bar (52) + 5 M1 bars (260)
 
         H1: macro trend | M15: structure context | M5: entry zone | M1: sniper precision
+        +2 per bar: OB proximity + Volume spike (SMC awareness)
         All features normalized by ATR.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # H1: current bar (50-dim) — macro trend (BOS/CHoCH)
+        # H1: current bar (50+2=52-dim) — macro trend (BOS/CHoCH)
         h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
         h1_bar = self.data_h1[h1_idx].copy()
         h1_bar[:10] = h1_bar[:10] / atr
+        h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx)
 
-        # M15: current bar (50-dim) — structure context (OB/FVG)
+        # M15: current bar (50+2=52-dim) — structure context (OB/FVG)
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_bar = self.data_m15[m15_idx].copy()
         m15_bar[:10] = m15_bar[:10] / atr
+        m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx)
 
-        # M5: current bar (50-dim) — entry zone
+        # M5: current bar (50+2=52-dim) — entry zone
         m5_bar = self.data_m5[m5_idx].copy()
         m5_bar[:10] = m5_bar[:10] / atr
+        m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx)
 
-        # M1: last 5 bars (250-dim) — sniper precision
+        # M1: last 5 bars (5×52=260-dim) — sniper precision
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
-        m1_window = self.data_m1[m1_start_idx:m1_end_idx + 1].copy()
-        m1_window[:, :10] = m1_window[:, :10] / atr
+        m1_enriched = []
+        for i in range(m1_start_idx, m1_end_idx + 1):
+            bar = self.data_m1[i].copy()
+            bar[:10] = bar[:10] / atr
+            bar = self._enrich_bar(bar, self.data_m1, i)
+            m1_enriched.append(bar)
 
         # Zero-pad if fewer than 5 M1 bars
-        if len(m1_window) < 5:
-            pad = np.zeros((5 - len(m1_window), self.n_features), dtype=np.float32)
-            m1_window = np.vstack([pad, m1_window])
+        while len(m1_enriched) < 5:
+            m1_enriched.insert(0, np.zeros(52, dtype=np.float32))
 
-        # Flatten: H1 (50) + M15 (50) + M5 (50) + M1 (250) = 400
-        obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_window.flatten()]).astype(np.float32)
+        m1_flat = np.concatenate(m1_enriched)
+
+        # Flatten: H1 (52) + M15 (52) + M5 (52) + M1 (260) = 416
+        obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_flat]).astype(np.float32)
 
         # Clip to prevent extreme values
         obs = np.clip(obs, -10.0, 10.0)

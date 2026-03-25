@@ -2,9 +2,9 @@
 V3.6 AttentionPPO -- Self-Attention Actor-Critic with Contrastive Head.
 
 Architecture:
-    400-dim flat obs → 8 tokens × 50-dim → Self-Attention (2L, 4H) → Actor/Critic/Contrastive heads
+    416-dim flat obs → 8 tokens × 52-dim → Self-Attention (2L, 4H) → Actor/Critic/Contrastive heads
     
-Tokens:
+Tokens (52-dim = 50 raw + OB_proximity + Volume_spike):
     [H1] [M15] [M5] [M1_bar1] [M1_bar2] [M1_bar3] [M1_bar4] [M1_bar5]
 """
 from __future__ import annotations
@@ -26,16 +26,17 @@ class AttentionPPO(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int = 400,
+        obs_dim: int = 416,
         n_actions: int = 4,
         n_tokens: int = 8,
-        token_dim: int = 50,
+        token_dim: int = 52,
         d_model: int = 64,
         n_heads: int = 4,
         n_layers: int = 2,
         d_ff: int = 256,
         dropout: float = 0.1,
         contrastive_dim: int = 128,
+        confidence_threshold: float = 0.70,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -43,6 +44,7 @@ class AttentionPPO(nn.Module):
         self.token_dim = token_dim
         self.d_model = d_model
         self.n_heads = n_heads
+        self.confidence_threshold = confidence_threshold
 
         # --- Token Embedding ---
         self.token_proj = nn.Linear(token_dim, d_model)
@@ -164,6 +166,14 @@ class AttentionPPO(nn.Module):
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
+            # --- M1 Confidence Gate ---
+            # If confidence < threshold for BUY/SELL, override to HOLD
+            probs = torch.softmax(logits, dim=-1)
+            max_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
+            is_entry = (action == 0) | (action == 1)  # BUY or SELL
+            low_confidence = max_prob < self.confidence_threshold
+            gate_mask = is_entry & low_confidence
+            action = torch.where(gate_mask, torch.tensor(2, device=obs.device), action)  # Override to HOLD
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         return action, log_prob, entropy, value
