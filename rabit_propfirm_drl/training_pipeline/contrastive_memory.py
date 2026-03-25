@@ -130,14 +130,14 @@ class ContrastiveMemory:
             return None
 
         # Helper to identify "beautiful" micro forms (Fake Setups)
-        # obs dims: H1(54) + M15(54) + M5(54) + M1_1(54)... M1_5(54) = 432
-        # M5 ob_prox = index 108 (M5 start) + 50 = 158
-        # M1_b5 vol_spike = index 378 (M1_b5 start) + 51 = 429
+        # obs dims: H1(56) + M15(56) + M5(56) + M1_1(56)... M1_5(56) = 448
+        # M5 ob_prox = index 112 (M5 start) + 50 = 162
+        # M1_b5 vol_spike = index 392 (M1_b5 start) + 51 = 443
         def is_fake_setup(obs: np.ndarray) -> bool:
-            if len(obs) != 432:
+            if len(obs) != 448:
                 return False
-            m5_ob_prox = obs[158]
-            m1_last_vol = obs[429]
+            m5_ob_prox = obs[162]
+            m1_last_vol = obs[443]
             # Beautiful if very close to M5 OB or huge M1 volume spike
             return m1_last_vol > 0.5 or m5_ob_prox < 0.2
 

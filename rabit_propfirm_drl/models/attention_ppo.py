@@ -34,10 +34,10 @@ class AttentionPPO(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int = 432,
+        obs_dim: int = 448,
         n_actions: int = 4,
         n_tokens: int = 8,
-        token_dim: int = 54,
+        token_dim: int = 56,
         d_model: int = 64,
         n_heads: int = 4,
         d_ff: int = 256,

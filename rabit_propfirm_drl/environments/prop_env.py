@@ -1,15 +1,13 @@
 """
 PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-V3.6.1 -- "Tot Nghiep" Architecture:
+V3.9 -- "Giao Thoa" Architecture:
     - Discrete action space: BUY=0, SELL=1, HOLD=2, CLOSE=3
-    - 4-TF Frame Stacking: H1 (1 bar, 52) + M15 (1 bar, 52) + M5 (1 bar, 52) + M1 (5 bars, 260) = 416-dim
-    - +2 features per bar: OB proximity (distance to Order Block) + Volume spike
-    - ATR Normalization: price features scaled by rolling ATR
-    - Auto SL from M5 Swing Points (no fixed SL/TP)
-    - Bot actively manages exits via CLOSE action
-    - Fixed lot (0.01), SL at Swing Low/High, NO fixed TP
-    - action_mode param: "discrete" (V3.6.1) or "continuous" (legacy)
+    - 4-TF Frame Stacking: H1 (56) + M15 (56) + M5 (56) + M1×5 (280) = 448-dim
+    - +6 features per bar: OB proximity + Volume spike + Spread + Session + OB Touch Count + Choppiness
+    - Trailing SL: Move SL to breakeven when unrealized PnL >= 1R
+    - Auto SL from M5 Swing Points, NO fixed TP
+    - Fixed lot (0.01), action_mode: "discrete" or "continuous" (legacy)
 """
 
 from __future__ import annotations
@@ -53,9 +51,9 @@ class MultiTFTradingEnv(gym.Env):
         - "discrete": Discrete(4) BUY/SELL/HOLD/CLOSE
         - "continuous": Box(5,) (legacy)
 
-    Observation (V3.6.1 discrete mode):
-        Flat Box(416,) = 1 H1 bar (52) + 1 M15 bar (52) + 1 M5 bar (52) + 5 M1 bars (260)
-        +2 features per bar: OB proximity + Volume spike
+    Observation (V3.9 discrete mode):
+        Flat Box(448,) = 1 H1 bar (56) + 1 M15 bar (56) + 1 M5 bar (56) + 5 M1 bars (280)
+        +6 features per bar: OB prox + Vol spike + Spread + Session + OB Touch + Choppiness
     """
 
     metadata = {"render_modes": ["human"]}
@@ -161,12 +159,12 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- Spaces ---
         if self.action_mode == "discrete":
-            # V3.7: BUY=0, SELL=1, HOLD=2, CLOSE=3
+            # V3.9: BUY=0, SELL=1, HOLD=2, CLOSE=3
             self.action_space = spaces.Discrete(4)
-            # Flat obs: 1 H1 (54) + 1 M15 (54) + 1 M5 (54) + 5 M1 (270) = 432-dim
+            # Flat obs: 1 H1 (56) + 1 M15 (56) + 1 M5 (56) + 5 M1 (280) = 448-dim
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(432,),
+                shape=(448,),
                 dtype=np.float32,
             )
         else:
@@ -227,6 +225,10 @@ class MultiTFTradingEnv(gym.Env):
         self.steps_since_last_trade = 0
         self.prev_unrealized = 0.0
         self._next_ticket = 1
+
+        # V3.9: OB Touch Count state
+        self._active_ob_zone = None  # (ob_high, ob_low) or None
+        self._ob_touch_count = 0
 
     # --- Gymnasium API ---
 
@@ -327,6 +329,18 @@ class MultiTFTradingEnv(gym.Env):
         """V3.4: Discrete BUY/SELL/HOLD/CLOSE step."""
         # action: 0=BUY, 1=SELL, 2=HOLD, 3=CLOSE
 
+        # --- V3.9: Trailing SL (breakeven at 1R) ---
+        for pos in self.positions:
+            sl_distance = abs(pos.entry_price - pos.sl_price)
+            unrealized = self._calc_position_pnl(pos, price)
+            # When profit >= 1R, move SL to entry (breakeven)
+            r_value = sl_distance * pos.lots * self.lot_value * self.pip_value
+            if r_value > 0 and unrealized >= r_value:
+                if pos.direction > 0 and pos.sl_price < pos.entry_price:
+                    pos.sl_price = pos.entry_price  # Trail up for LONG
+                elif pos.direction < 0 and pos.sl_price > pos.entry_price:
+                    pos.sl_price = pos.entry_price  # Trail down for SHORT
+
         # --- Check existing positions (SL only, no TP) ---
         realized_pnl = 0.0
         trade_closed = False
@@ -345,7 +359,7 @@ class MultiTFTradingEnv(gym.Env):
                     "entry": pos.entry_price, "exit": price,
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
-                    "close_reason": "SL_HIT",
+                    "close_reason": "SL_HIT" if pnl < 0 else "TRAILING_BE",
                 })
 
         # --- Session close ---
@@ -716,21 +730,140 @@ class MultiTFTradingEnv(gym.Env):
         else:
             return 0.1   # Off-hours
 
+    def _compute_ob_touch_count(self, m5_idx: int) -> float:
+        """
+        V3.9: Track how many times M5 candles have tested the active Order Block.
+        Returns touch_count / 5.0 (normalized 0-1, clipped).
+        """
+        if not self._use_real_ohlcv or m5_idx >= len(self.ohlcv_m5):
+            return 0.0
+
+        ob_bull_col = min(35, self.data_m5.shape[1] - 1)
+        ob_bear_col = min(36, self.data_m5.shape[1] - 1)
+
+        # Check if a new OB has formed in recent bars
+        lookback = 20
+        new_ob_zone = None
+        for dist in range(0, min(lookback, m5_idx)):
+            idx = m5_idx - dist
+            if idx < 0 or idx >= len(self.data_m5):
+                continue
+            if self.data_m5[idx, ob_bull_col] > 0.5 or self.data_m5[idx, ob_bear_col] > 0.5:
+                # Found the nearest OB — use that bar's OHLCV as OB zone
+                ob_high = float(self.ohlcv_m5[idx, 1])  # High
+                ob_low = float(self.ohlcv_m5[idx, 2])    # Low
+                new_ob_zone = (ob_high, ob_low)
+                break
+
+        if new_ob_zone is None:
+            self._active_ob_zone = None
+            self._ob_touch_count = 0
+            return 0.0
+
+        # If OB changed, reset counter
+        if self._active_ob_zone != new_ob_zone:
+            self._active_ob_zone = new_ob_zone
+            self._ob_touch_count = 0
+
+        # Check if current M5 bar touches the OB zone (wick or close)
+        ob_high, ob_low = self._active_ob_zone
+        cur_high = float(self.ohlcv_m5[m5_idx, 1])
+        cur_low = float(self.ohlcv_m5[m5_idx, 2])
+        cur_close = float(self.ohlcv_m5[m5_idx, 3])
+
+        # Check if OB is broken (close through the entire zone)
+        if cur_close > ob_high + (ob_high - ob_low) * 0.5:
+            self._active_ob_zone = None
+            self._ob_touch_count = 0
+            return 0.0
+        if cur_close < ob_low - (ob_high - ob_low) * 0.5:
+            self._active_ob_zone = None
+            self._ob_touch_count = 0
+            return 0.0
+
+        # Touch = wick into zone
+        if cur_low <= ob_high and cur_high >= ob_low:
+            self._ob_touch_count += 1
+
+        return min(self._ob_touch_count / 5.0, 1.0)
+
+    def _compute_m15_choppiness(self, m5_idx: int, period: int = 14) -> float:
+        """
+        V3.9: M15 Choppiness Index (CHOP-14).
+        CHOP = 100 * log10(sum(TR_14) / (MaxHigh_14 - MinLow_14)) / log10(14)
+        Returns normalized value in [0, 1] (raw CHOP / 100).
+        """
+        if not self._use_real_ohlcv:
+            return 0.5  # Neutral default
+
+        # Convert M5 index to approximate M15 index
+        m15_idx = m5_idx // self.m5_per_m15
+        # We need M15 OHLCV — derive from M5 OHLCV by grouping 3 bars
+        m15_start = max(0, (m15_idx - period) * self.m5_per_m15)
+        m15_end = min(len(self.ohlcv_m5), (m15_idx + 1) * self.m5_per_m15)
+
+        if m15_end - m15_start < self.m5_per_m15 * period:
+            return 0.5  # Not enough data
+
+        # Build M15 OHLCV from M5 groups
+        m15_highs = []
+        m15_lows = []
+        m15_closes = []
+        m15_prev_closes = []
+
+        for g in range(period):
+            g_start = m15_start + g * self.m5_per_m15
+            g_end = min(g_start + self.m5_per_m15, len(self.ohlcv_m5))
+            if g_end <= g_start:
+                return 0.5
+            group = self.ohlcv_m5[g_start:g_end]
+            m15_highs.append(float(np.max(group[:, 1])))
+            m15_lows.append(float(np.min(group[:, 2])))
+            m15_closes.append(float(group[-1, 3]))
+            # Previous close for True Range
+            if g > 0:
+                prev_g_end = g_start
+                prev_g_start = max(0, prev_g_end - self.m5_per_m15)
+                m15_prev_closes.append(float(self.ohlcv_m5[prev_g_end - 1, 3]))
+            else:
+                m15_prev_closes.append(m15_closes[0])
+
+        # Compute True Range for each M15 bar
+        total_tr = 0.0
+        for i in range(period):
+            tr1 = m15_highs[i] - m15_lows[i]
+            tr2 = abs(m15_highs[i] - m15_prev_closes[i])
+            tr3 = abs(m15_lows[i] - m15_prev_closes[i])
+            total_tr += max(tr1, tr2, tr3)
+
+        max_high = max(m15_highs)
+        min_low = min(m15_lows)
+        range_hl = max_high - min_low
+
+        if range_hl < 1e-10 or total_tr < 1e-10:
+            return 1.0  # Perfectly choppy
+
+        chop = 100.0 * np.log10(total_tr / range_hl) / np.log10(period)
+        chop = np.clip(chop, 0.0, 100.0)
+        return float(chop / 100.0)  # Normalize to [0, 1]
+
     def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int, m5_idx: int = 0) -> np.ndarray:
-        """V3.7: Append OB proximity + Volume spike + Spread + Session to a bar (50→54)."""
+        """V3.9: Append 6 features to a bar (50→56)."""
         ob_prox = self._compute_ob_proximity(data, bar_idx)
         vol_spike = self._compute_volume_spike(data, bar_idx)
         spread = self._compute_synthetic_spread(m5_idx)
         session = self._compute_session_phase(m5_idx)
-        return np.append(bar, [ob_prox, vol_spike, spread, session]).astype(np.float32)
+        ob_touch = self._compute_ob_touch_count(m5_idx)
+        choppiness = self._compute_m15_choppiness(m5_idx)
+        return np.append(bar, [ob_prox, vol_spike, spread, session, ob_touch, choppiness]).astype(np.float32)
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.7: Flat 432-dim observation.
-        = 1 H1 bar (54) + 1 M15 bar (54) + 1 M5 bar (54) + 5 M1 bars (270)
+        V3.9: Flat 448-dim observation.
+        = 1 H1 bar (56) + 1 M15 bar (56) + 1 M5 bar (56) + 5 M1 bars (280)
 
         H1: macro trend | M15: structure context | M5: entry zone | M1: sniper precision
-        +4 per bar: OB proximity + Volume spike + Spread + Session phase
+        +6 per bar: OB proximity + Volume spike + Spread + Session + OB Touch + Choppiness
         All features normalized by ATR.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
@@ -765,11 +898,11 @@ class MultiTFTradingEnv(gym.Env):
 
         # Zero-pad if fewer than 5 M1 bars
         while len(m1_enriched) < 5:
-            m1_enriched.insert(0, np.zeros(54, dtype=np.float32))
+            m1_enriched.insert(0, np.zeros(56, dtype=np.float32))
 
         m1_flat = np.concatenate(m1_enriched)
 
-        # Flatten: H1 (54) + M15 (54) + M5 (54) + M1 (270) = 432
+        # Flatten: H1 (56) + M15 (56) + M5 (56) + M1 (280) = 448
         obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_flat]).astype(np.float32)
 
         # Clip to prevent extreme values
