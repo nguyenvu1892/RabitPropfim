@@ -6,6 +6,14 @@
 
 ## 25/03/2026
 
+### [CHORE] Trọn gói Dọn dẹp Dự án (Project Cleanup) — 25/03 23:15
+- **Gỡ bỏ hàng loạt các tệp Parquet trung gian:** Xóa hơn 75 file RAW OHLCV và features sinh ra từ `fetch_historical_data.py` chiếm gần 100MB (vì agent V3.6 load trực tiếp từ file `_50dim.npy` thay vì đọc lại parquet thô).
+- **Xóa file Backup cũ:** Loại bỏ tệp sao lưu v3.2 `data_v32.zip` (~140MB).
+- **Loại bỏ Obsolete Scripts:** Dọn dẹp 9 kịch bản thử nghiệm cũ không còn được bảo trì: `v33`, `v34`, `v35`, `backtest*`, giúp thư mục `scripts` gọn gàng tập trung vào phiên bản chính.
+- Dự án nhẹ nhàng, sẵn sàng cho các vòng lặp V3.6/V3.7 tiếp theo!
+
+---
+
 ### [MAJOR] V3.6 — "Tự Vấn" (Self-Reflection) — AttentionPPO + Contrastive Learning — 25/03 01:50
 - **Commits:** `c4ff8dc`, `dc61ae5` on `main`
 - **Tư duy mới:** Bỏ hẳn Imitation Learning (copy lệnh). Bot phải TỰ SO SÁNH WIN vs LOSS.
