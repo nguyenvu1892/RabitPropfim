@@ -472,8 +472,8 @@ def train_stage2(
                 value_loss = F.mse_loss(new_val, mb_ret)
                 entropy_loss = entropy.mean()
 
-                # Contrastive loss — V3.7: Hard Negative Mining
-                pair = memory.sample_hard_negative_pairs(model, cl_batch, device)
+                # Contrastive loss — V3.8: Fake Setup Mining
+                pair = memory.sample_fake_setup_pairs(cl_batch, device)
                 cl_loss_val = contrastive_loss(model, pair[0], pair[1]) if pair else torch.tensor(0.0, device=device)
 
                 loss = (policy_loss + vf_coef * value_loss

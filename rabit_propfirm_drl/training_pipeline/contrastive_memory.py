@@ -1,9 +1,10 @@
 """
-V3.7 Contrastive Memory -- Hard Negative Mining + WIN/LOSS pair storage.
+V3.8 Contrastive Memory -- Fake Setup Mining + WIN/LOSS pair storage.
 
 Instead of copying expert trades (Imitation Learning), the bot learns to DISTINGUISH
 what makes a trade WIN vs LOSS by comparing embeddings of trades in similar contexts.
-V3.7: Hard Negative Mining — prioritizes most "painful" losses (high confidence + similar context).
+V3.8: Fake Setup Mining — prioritizes LOSS trades where Micro form (M5/M1) looks beautiful 
+(volume spike or OB proximity) but macro context failed it.
 """
 from __future__ import annotations
 import json
@@ -110,22 +111,16 @@ class ContrastiveMemory:
 
         return win_obs, loss_obs
 
-    def sample_hard_negative_pairs(
+    def sample_fake_setup_pairs(
         self,
-        model,
         batch_size: int = 64,
         device: torch.device = None,
-        top_k_pct: float = 0.20,
         cosine_threshold: float = 0.85,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """
-        V3.7 Hard Negative Mining: sample the most "painful" LOSS trades.
-
-        1. Filter top-20% most confident LOSS trades (bot was sure but lost)
-        2. For each, find the WIN trade with highest cosine similarity (most similar context)
-        3. Only keep pairs where cosine sim > threshold
-
-        Falls back to regular sampling if not enough hard negatives.
+        V3.8 Fake Setup Mining: sample LOSS trades where Micro form is 'beautiful'
+        but the trade still lost (likely due to bad Macro context).
+        Pairs them with similar WIN trades to teach the Cross-Attention layer.
         """
         if device is None:
             device = torch.device("cpu")
@@ -133,6 +128,18 @@ class ContrastiveMemory:
         valid_syms = [s for s in SYMBOLS if len(self.wins[s]) >= 3 and len(self.losses[s]) >= 3]
         if not valid_syms:
             return None
+
+        # Helper to identify "beautiful" micro forms (Fake Setups)
+        # obs dims: H1(54) + M15(54) + M5(54) + M1_1(54)... M1_5(54) = 432
+        # M5 ob_prox = index 108 (M5 start) + 50 = 158
+        # M1_b5 vol_spike = index 378 (M1_b5 start) + 51 = 429
+        def is_fake_setup(obs: np.ndarray) -> bool:
+            if len(obs) != 432:
+                return False
+            m5_ob_prox = obs[158]
+            m1_last_vol = obs[429]
+            # Beautiful if very close to M5 OB or huge M1 volume spike
+            return m1_last_vol > 0.5 or m5_ob_prox < 0.2
 
         hard_win_obs = []
         hard_loss_obs = []
@@ -143,18 +150,21 @@ class ContrastiveMemory:
             if len(losses) < 5 or len(wins) < 5:
                 continue
 
-            # Step 1: Sort losses by confidence (descending), take top-K%
-            losses_sorted = sorted(losses, key=lambda e: e.get("confidence", 0), reverse=True)
-            top_k = max(3, int(len(losses_sorted) * top_k_pct))
-            hard_losses = losses_sorted[:top_k]
+            # Step 1: Filter LOSS trades to find Fake Setups
+            fake_losses = [e for e in losses if is_fake_setup(e["obs"])]
+            
+            # If no fake setups, fallback to top-confidence losses
+            if len(fake_losses) == 0:
+                losses_sorted = sorted(losses, key=lambda e: e.get("confidence", 0), reverse=True)
+                fake_losses = losses_sorted[:max(3, int(len(losses) * 0.1))]
 
             # Step 2: Build WIN obs matrix for cosine similarity
             win_obs_np = np.array([w["obs"] for w in wins])  # (N_win, obs_dim)
             win_norms = np.linalg.norm(win_obs_np, axis=1, keepdims=True) + 1e-8
             win_normalized = win_obs_np / win_norms
 
-            # Step 3: For each hard loss, find most similar WIN
-            for loss_entry in hard_losses:
+            # Step 3: For each fake setup loss, find most similar WIN
+            for loss_entry in fake_losses:
                 loss_obs = loss_entry["obs"]
                 loss_norm = np.linalg.norm(loss_obs) + 1e-8
                 loss_normalized = loss_obs / loss_norm
@@ -170,7 +180,7 @@ class ContrastiveMemory:
 
         if len(hard_win_obs) < 3:
             # Fallback to regular sampling
-            logger.debug("Not enough hard negatives (%d), falling back to regular", len(hard_win_obs))
+            logger.debug("Not enough fake setups (%d), falling back to regular", len(hard_win_obs))
             return self.sample_contrastive_pairs(batch_size, device)
 
         # Sample batch_size pairs from hard negatives

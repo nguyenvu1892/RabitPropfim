@@ -1,18 +1,18 @@
 """
-V3.7.1 AttentionPPO -- 2-Stage Hierarchical Attention with Token Dropout.
+V3.8 AttentionPPO -- Cross-Attention (Micro=Q, Macro=K/V) with Fake Setup Mining.
 
 Architecture:
     432-dim flat obs → 8 tokens × 54-dim
     
-    Stage 1 (Specialist):
-        MacroAttn: H1 + M15 (2 tokens) → Self-Attention (1L, 4H) → macro_ctx
-        MicroAttn: M5 + M1×5 (6 tokens) → Self-Attention (1L, 4H) → micro_ctx
+    Stage 1: Independent Feature Extraction
+        Macro: H1 + M15 (2 tokens) → Self-Attention (1L, 4H) → macro_ctx
+        Micro: M5 + M1×5 (6 tokens) → Self-Attention (1L, 4H) → micro_ctx
     
-    Stage 2 (Fusion):
-        FusionAttn: [macro_ctx, micro_ctx] → Cross-Attention (1L, 4H) → decision
-    
-    Token Dropout: 15% random masking during S1/S3 training (OFF during S2/eval)
-    
+    Stage 2: Gated Cross-Attention
+        Q = micro_ctx, K = V = macro_ctx
+        Micro tokens look up Macro context to validate their setups.
+        Output → Average pooled → Actor/Critic/Contrastive Head
+
 Tokens (54-dim = 50 raw + OB_proximity + Volume_spike + Spread + Session):
     [H1] [M15] [M5] [M1_bar1] [M1_bar2] [M1_bar3] [M1_bar4] [M1_bar5]
 """
@@ -29,10 +29,7 @@ MICRO_TOKENS = [2, 3, 4, 5, 6, 7]  # M5, M1_b1-b5
 
 class AttentionPPO(nn.Module):
     """
-    2-Stage Hierarchical Attention PPO.
-    
-    Input:  (B, 432) flat obs
-    Output: logits (B, 4), value (B, 1), attn_weights (B, 1, 8, 8)
+    V3.8 Cross-Attention PPO.
     """
 
     def __init__(
@@ -61,13 +58,12 @@ class AttentionPPO(nn.Module):
         self.confidence_mode = confidence_mode
         self.confidence_ratio = confidence_ratio
         self.token_dropout_rate = token_dropout_rate
-        self.token_dropout_enabled = True  # Toggle per stage
+        self.token_dropout_enabled = True
 
         # --- Shared Token Embedding ---
         self.token_proj = nn.Linear(token_dim, d_model)
 
-        # --- Stage 1: Specialist Encoders ---
-        # Macro: H1 + M15 (2 tokens)
+        # --- Stage 1: Self-Attention Encoders ---
         self.macro_pos = nn.Parameter(torch.randn(1, 2, d_model) * 0.02)
         macro_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
@@ -75,7 +71,6 @@ class AttentionPPO(nn.Module):
         )
         self.macro_encoder = nn.TransformerEncoder(macro_layer, num_layers=1)
 
-        # Micro: M5 + M1×5 (6 tokens)
         self.micro_pos = nn.Parameter(torch.randn(1, 6, d_model) * 0.02)
         micro_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
@@ -83,13 +78,19 @@ class AttentionPPO(nn.Module):
         )
         self.micro_encoder = nn.TransformerEncoder(micro_layer, num_layers=1)
 
-        # --- Stage 2: Fusion Encoder ---
-        self.fusion_pos = nn.Parameter(torch.randn(1, 2, d_model) * 0.02)
-        fusion_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        # --- Stage 2: Cross-Attention (Micro looks at Macro) ---
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
         )
-        self.fusion_encoder = nn.TransformerEncoder(fusion_layer, num_layers=1)
+        self.cross_norm = nn.LayerNorm(d_model)
+        self.cross_ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.cross_ff_norm = nn.LayerNorm(d_model)
 
         # --- Output Heads ---
         self.actor_head = nn.Sequential(
@@ -113,28 +114,21 @@ class AttentionPPO(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _tokenize(self, obs: torch.Tensor) -> torch.Tensor:
-        """Reshape (B, 432) → (B, 8, 54) tokens."""
         B = obs.shape[0]
         return obs.view(B, self.n_tokens, self.token_dim)
 
     def _apply_token_dropout(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Token Dropout: randomly zero out entire tokens during training.
-        Each token has token_dropout_rate probability of being masked.
-        """
         if not self.training or not self.token_dropout_enabled:
             return tokens
         B, N, D = tokens.shape
-        # Create mask: (B, N, 1) — each token independently masked
         mask = torch.bernoulli(
             torch.full((B, N, 1), 1.0 - self.token_dropout_rate, device=tokens.device)
         )
-        # Scale by 1/(1-p) to maintain expected value (like standard dropout)
         tokens = tokens * mask / (1.0 - self.token_dropout_rate)
         return tokens
 
-    def _encode_specialist(self, x: torch.Tensor, encoder, pos_embed):
-        """Run one specialist encoder with manual attention extraction."""
+    def _encode_self_attn(self, x: torch.Tensor, encoder, pos_embed):
+        """Run self-attention encoder and extract weights."""
         x_norm = encoder.layers[0].norm1(x)
         attn_out, attn_w = encoder.layers[0].self_attn(
             x_norm, x_norm, x_norm,
@@ -152,68 +146,59 @@ class AttentionPPO(nn.Module):
 
     def _encode(self, obs: torch.Tensor):
         """
-        2-Stage Hierarchical Encoding.
-        Returns: pooled (B, d_model), token_importance (B, 8)
+        V3.8 Cross-Attention Encoding.
+        Returns: pooled (B, d_model), cross_attn_w (B, 1, 8, 8)
         """
         B = obs.shape[0]
         tokens = self._tokenize(obs)
         tokens = self._apply_token_dropout(tokens)
         x = self.token_proj(tokens)  # (B, 8, d_model)
 
-        # --- Stage 1: Specialist Attention ---
-        # Macro: tokens 0,1 (H1, M15)
-        macro_x = x[:, MACRO_TOKENS, :] + self.macro_pos  # (B, 2, d_model)
-        macro_out, macro_attn = self._encode_specialist(macro_x, self.macro_encoder, self.macro_pos)
-        macro_ctx = macro_out.mean(dim=1)  # (B, d_model)
+        # 1. Macro Context (H1, M15)
+        macro_x = x[:, MACRO_TOKENS, :] + self.macro_pos
+        macro_ctx, macro_attn = self._encode_self_attn(macro_x, self.macro_encoder, self.macro_pos)
 
-        # Micro: tokens 2-7 (M5, M1×5)
-        micro_x = x[:, MICRO_TOKENS, :] + self.micro_pos  # (B, 6, d_model)
-        micro_out, micro_attn = self._encode_specialist(micro_x, self.micro_encoder, self.micro_pos)
-        micro_ctx = micro_out.mean(dim=1)  # (B, d_model)
+        # 2. Micro Context (M5, M1x5)
+        micro_x = x[:, MICRO_TOKENS, :] + self.micro_pos
+        micro_ctx, micro_attn = self._encode_self_attn(micro_x, self.micro_encoder, self.micro_pos)
 
-        # --- Stage 2: Fusion ---
-        fusion_input = torch.stack([macro_ctx, micro_ctx], dim=1)  # (B, 2, d_model)
-        fusion_input = fusion_input + self.fusion_pos
-        fusion_out, fusion_attn = self._encode_specialist(fusion_input, self.fusion_encoder, self.fusion_pos)
-        pooled = fusion_out.mean(dim=1)  # (B, d_model)
+        # 3. Cross-Attention: Micro (Q) queries Macro (K, V)
+        micro_ctx_norm = self.cross_norm(micro_ctx)
+        macro_ctx_norm = self.cross_norm(macro_ctx)
+        
+        # attn_w: (B, seq_Q, seq_K) -> (B, 6, 2)
+        attn_out, cross_attn_w = self.cross_attn(
+            query=micro_ctx_norm,
+            key=macro_ctx_norm,
+            value=macro_ctx_norm,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        
+        # Add & Norm, then FF
+        micro_fused = micro_ctx + attn_out
+        micro_fused = micro_fused + self.cross_ff(self.cross_ff_norm(micro_fused))
 
-        # --- Compute per-token importance (B, 8) for backward compatibility ---
-        # fusion_attn: (B, heads, 2, 2) — [macro_weight, micro_weight]
-        fusion_weights = fusion_attn.mean(dim=1)  # (B, 2, 2) → average heads
-        # How much the model relies on macro vs micro (row-wise sum = 1)
-        macro_importance = fusion_weights[:, :, 0].mean(dim=1)  # (B,) — macro column
-        micro_importance = fusion_weights[:, :, 1].mean(dim=1)  # (B,) — micro column
+        # Output is pooled micro tokens (since they now contain macro context)
+        pooled = micro_fused.mean(dim=1)  # (B, d_model)
 
-        # Distribute importance within each specialist
-        macro_self = macro_attn.mean(dim=1).mean(dim=1)  # (B, 2) — per-token within macro
-        micro_self = micro_attn.mean(dim=1).mean(dim=1)  # (B, 6) — per-token within micro
-
-        # Normalize within each group
-        macro_self = macro_self / (macro_self.sum(dim=1, keepdim=True) + 1e-8)
-        micro_self = micro_self / (micro_self.sum(dim=1, keepdim=True) + 1e-8)
-
-        # Final per-token importance: group_importance × within_group_importance
-        token_imp = torch.zeros(B, 8, device=obs.device)
-        token_imp[:, 0] = macro_importance * macro_self[:, 0]  # H1
-        token_imp[:, 1] = macro_importance * macro_self[:, 1]  # M15
-        token_imp[:, 2] = micro_importance * micro_self[:, 0]  # M5
-        token_imp[:, 3] = micro_importance * micro_self[:, 1]  # M1_b1
-        token_imp[:, 4] = micro_importance * micro_self[:, 2]  # M1_b2
-        token_imp[:, 5] = micro_importance * micro_self[:, 3]  # M1_b3
-        token_imp[:, 6] = micro_importance * micro_self[:, 4]  # M1_b4
-        token_imp[:, 7] = micro_importance * micro_self[:, 5]  # M1_b5
-
-        # Normalize to sum=1
-        token_imp = token_imp / (token_imp.sum(dim=1, keepdim=True) + 1e-8)
-
-        # Construct fake (B, 1, 8, 8) attention matrix for backward compatibility
-        # Each row is a copy of token_importance
-        attn_compat = token_imp.unsqueeze(1).unsqueeze(1).expand(-1, 1, 8, -1)  # (B, 1, 8, 8)
+        # --- Fake 8x8 matrix for backward compatibility with explain_trade.py ---
+        # The cross_attn_w gives us (B, 6, 2) -> How much each Micro token looks at each Macro token.
+        # We will pad this to (B, 8, 8) format so backtest_v36.py doesn't crash.
+        # We place cross_attn_w in the [2:8, 0:2] block.
+        attn_compat = torch.zeros(B, 8, 8, device=obs.device)
+        attn_compat[:, MICRO_TOKENS[0]:MICRO_TOKENS[-1]+1, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1] = cross_attn_w
+        
+        # Add self-attention for completeness in analysis
+        attn_compat[:, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1] = macro_attn.mean(dim=1)
+        # Normalize rows to 1 for display
+        attn_compat = attn_compat / (attn_compat.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        attn_compat = attn_compat.unsqueeze(1)  # (B, 1, 8, 8)
 
         return pooled, attn_compat
 
     def forward(self, obs: torch.Tensor):
-        """Returns: logits (B, 4), value (B, 1), attn_weights (B, 1, 8, 8)"""
         pooled, attn_weights = self._encode(obs)
         logits = self.actor_head(pooled)
         value = self.critic_head(pooled)
@@ -231,7 +216,6 @@ class AttentionPPO(nn.Module):
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
-            # --- Confidence Gate (INFERENCE ONLY) ---
             if not self.training:
                 probs = torch.softmax(logits, dim=-1)
                 is_entry = (action == 0) | (action == 1)
@@ -251,12 +235,10 @@ class AttentionPPO(nn.Module):
         return action, log_prob, entropy, value
 
     def get_embedding(self, obs: torch.Tensor) -> torch.Tensor:
-        """Get L2-normalized embedding for contrastive learning."""
         pooled, _ = self._encode(obs)
         embed = self.contrastive_head(pooled)
         return F.normalize(embed, p=2, dim=-1)
 
     def get_attention_weights(self, obs: torch.Tensor) -> torch.Tensor:
-        """Get attention weights for analysis. Returns (B, 1, 8, 8)."""
         _, attn_weights = self._encode(obs)
         return attn_weights
