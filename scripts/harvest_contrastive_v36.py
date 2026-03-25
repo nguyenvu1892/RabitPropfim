@@ -89,8 +89,11 @@ def main():
                 obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
                 obs_t = torch.nan_to_num(obs_t, nan=0.0)
                 with torch.no_grad():
-                    action, _, _, _ = model.get_action_and_value(obs_t)
-                    action = int(action.item())
+                    logits, _, _ = model(obs_t)
+                    probs = torch.softmax(logits, dim=-1).squeeze(0)
+                    dist = torch.distributions.Categorical(probs=probs)
+                    action = int(dist.sample().item())
+                    action_confidence = float(probs[action])
 
                 # Track new positions
                 old_tickets = {p.ticket for p in env.positions}
@@ -105,6 +108,7 @@ def main():
                         "obs": current_obs,
                         "action": 0 if pos.direction > 0 else 1,
                         "regime": regime,
+                        "confidence": action_confidence,
                     }
 
                 # Check for closed trades
@@ -122,6 +126,7 @@ def main():
                                 pnl=pnl,
                                 symbol=sym,
                                 regime=ed["regime"],
+                                confidence=ed["confidence"],
                             )
                 prev_trade_count = new_trade_count
 

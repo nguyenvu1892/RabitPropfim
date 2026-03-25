@@ -1,10 +1,10 @@
 """
-V3.6 AttentionPPO -- Self-Attention Actor-Critic with Contrastive Head.
+V3.7 AttentionPPO -- Self-Attention Actor-Critic with Contrastive Head.
 
 Architecture:
-    416-dim flat obs → 8 tokens × 52-dim → Self-Attention (2L, 4H) → Actor/Critic/Contrastive heads
+    432-dim flat obs → 8 tokens × 54-dim → Self-Attention (2L, 4H) → Actor/Critic/Contrastive heads
     
-Tokens (52-dim = 50 raw + OB_proximity + Volume_spike):
+Tokens (54-dim = 50 raw + OB_proximity + Volume_spike + Spread + Session):
     [H1] [M15] [M5] [M1_bar1] [M1_bar2] [M1_bar3] [M1_bar4] [M1_bar5]
 """
 from __future__ import annotations
@@ -26,10 +26,10 @@ class AttentionPPO(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int = 416,
+        obs_dim: int = 432,
         n_actions: int = 4,
         n_tokens: int = 8,
-        token_dim: int = 52,
+        token_dim: int = 54,
         d_model: int = 64,
         n_heads: int = 4,
         n_layers: int = 2,

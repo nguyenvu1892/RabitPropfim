@@ -1,8 +1,9 @@
 """
-V3.6 Contrastive Memory -- Stores WIN/LOSS trade pairs for contrastive learning.
+V3.7 Contrastive Memory -- Hard Negative Mining + WIN/LOSS pair storage.
 
 Instead of copying expert trades (Imitation Learning), the bot learns to DISTINGUISH
 what makes a trade WIN vs LOSS by comparing embeddings of trades in similar contexts.
+V3.7: Hard Negative Mining — prioritizes most "painful" losses (high confidence + similar context).
 """
 from __future__ import annotations
 import json
@@ -39,6 +40,7 @@ class ContrastiveMemory:
         pnl: float,
         symbol: str,
         regime: str = "unknown",
+        confidence: float = 0.0,
     ):
         """Add a completed trade to the appropriate buffer."""
         entry = {
@@ -46,6 +48,7 @@ class ContrastiveMemory:
             "action": action,
             "pnl": float(pnl),
             "regime": regime,
+            "confidence": float(confidence),
         }
         if pnl > 0:
             self.wins[symbol].append(entry)
@@ -107,6 +110,76 @@ class ContrastiveMemory:
 
         return win_obs, loss_obs
 
+    def sample_hard_negative_pairs(
+        self,
+        model,
+        batch_size: int = 64,
+        device: torch.device = None,
+        top_k_pct: float = 0.20,
+        cosine_threshold: float = 0.85,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """
+        V3.7 Hard Negative Mining: sample the most "painful" LOSS trades.
+
+        1. Filter top-20% most confident LOSS trades (bot was sure but lost)
+        2. For each, find the WIN trade with highest cosine similarity (most similar context)
+        3. Only keep pairs where cosine sim > threshold
+
+        Falls back to regular sampling if not enough hard negatives.
+        """
+        if device is None:
+            device = torch.device("cpu")
+
+        valid_syms = [s for s in SYMBOLS if len(self.wins[s]) >= 3 and len(self.losses[s]) >= 3]
+        if not valid_syms:
+            return None
+
+        hard_win_obs = []
+        hard_loss_obs = []
+
+        for sym in valid_syms:
+            losses = list(self.losses[sym])
+            wins = list(self.wins[sym])
+            if len(losses) < 5 or len(wins) < 5:
+                continue
+
+            # Step 1: Sort losses by confidence (descending), take top-K%
+            losses_sorted = sorted(losses, key=lambda e: e.get("confidence", 0), reverse=True)
+            top_k = max(3, int(len(losses_sorted) * top_k_pct))
+            hard_losses = losses_sorted[:top_k]
+
+            # Step 2: Build WIN obs matrix for cosine similarity
+            win_obs_np = np.array([w["obs"] for w in wins])  # (N_win, obs_dim)
+            win_norms = np.linalg.norm(win_obs_np, axis=1, keepdims=True) + 1e-8
+            win_normalized = win_obs_np / win_norms
+
+            # Step 3: For each hard loss, find most similar WIN
+            for loss_entry in hard_losses:
+                loss_obs = loss_entry["obs"]
+                loss_norm = np.linalg.norm(loss_obs) + 1e-8
+                loss_normalized = loss_obs / loss_norm
+
+                # Cosine similarity with all wins
+                similarities = win_normalized @ loss_normalized  # (N_win,)
+                best_idx = int(np.argmax(similarities))
+                best_sim = float(similarities[best_idx])
+
+                if best_sim >= cosine_threshold:
+                    hard_win_obs.append(wins[best_idx]["obs"])
+                    hard_loss_obs.append(loss_obs)
+
+        if len(hard_win_obs) < 3:
+            # Fallback to regular sampling
+            logger.debug("Not enough hard negatives (%d), falling back to regular", len(hard_win_obs))
+            return self.sample_contrastive_pairs(batch_size, device)
+
+        # Sample batch_size pairs from hard negatives
+        indices = [random.randint(0, len(hard_win_obs) - 1) for _ in range(batch_size)]
+        win_batch = torch.from_numpy(np.array([hard_win_obs[i] for i in indices])).float().to(device)
+        loss_batch = torch.from_numpy(np.array([hard_loss_obs[i] for i in indices])).float().to(device)
+
+        return win_batch, loss_batch
+
     def stats(self) -> dict:
         """Return current memory statistics."""
         return {
@@ -125,8 +198,8 @@ class ContrastiveMemory:
         path.mkdir(parents=True, exist_ok=True)
         for sym in SYMBOLS:
             safe = sym.replace(".", "_")
-            wins = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"]} for e in self.wins[sym]]
-            losses = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"]} for e in self.losses[sym]]
+            wins = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"], "confidence": e.get("confidence", 0)} for e in self.wins[sym]]
+            losses = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"], "confidence": e.get("confidence", 0)} for e in self.losses[sym]]
             with open(path / f"{safe}_wins.json", "w") as f:
                 json.dump(wins, f)
             with open(path / f"{safe}_losses.json", "w") as f:
@@ -147,11 +220,11 @@ class ContrastiveMemory:
             if wins_path.exists():
                 with open(wins_path) as f:
                     for e in json.load(f):
-                        mem.wins[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown")})
+                        mem.wins[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown"), "confidence": e.get("confidence", 0)})
             if losses_path.exists():
                 with open(losses_path) as f:
                     for e in json.load(f):
-                        mem.losses[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown")})
+                        mem.losses[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown"), "confidence": e.get("confidence", 0)})
         logger.info("ContrastiveMemory loaded from %s (%d entries)", path, mem.total_entries())
         return mem
 

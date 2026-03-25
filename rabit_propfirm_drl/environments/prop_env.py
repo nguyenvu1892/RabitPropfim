@@ -161,12 +161,12 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- Spaces ---
         if self.action_mode == "discrete":
-            # V3.6.1: BUY=0, SELL=1, HOLD=2, CLOSE=3
+            # V3.7: BUY=0, SELL=1, HOLD=2, CLOSE=3
             self.action_space = spaces.Discrete(4)
-            # Flat obs: 1 H1 (52) + 1 M15 (52) + 1 M5 (52) + 5 M1 (260) = 416-dim
+            # Flat obs: 1 H1 (54) + 1 M15 (54) + 1 M5 (54) + 5 M1 (270) = 432-dim
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(416,),
+                shape=(432,),
                 dtype=np.float32,
             )
         else:
@@ -679,58 +679,97 @@ class MultiTFTradingEnv(gym.Env):
             return min((vol_ratio - threshold) / threshold, 1.0)
         return 0.0
 
-    def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int) -> np.ndarray:
-        """Append OB proximity + Volume spike to a bar (50→52)."""
+    def _compute_synthetic_spread(self, m5_idx: int) -> float:
+        """
+        V3.7: Synthetic spread based on trading session.
+        Asia(low vol) = wide spread, London/NY(high vol) = tight spread.
+        Returns normalized spread: 0.0 (tight) to 1.0 (wide).
+        """
+        # M1 bars per day ≈ 1440, M5 bars per day ≈ 288
+        bar_in_day = m5_idx % 288  # Position within trading day
+        hour = (bar_in_day * 5) / 60  # Convert to hours (0-24)
+        # Session breakdown (UTC):
+        # Asia:   0-8  (wide spread)
+        # London: 8-16 (tight spread)
+        # NY:     13-21 (tight spread)
+        # Off:    21-24 (wide spread)
+        if 8 <= hour < 21:  # London + NY overlap
+            return 0.1 + 0.1 * abs(hour - 14.5) / 6.5  # Tightest at London/NY overlap
+        else:
+            return 0.7 + 0.3 * min(abs(hour - 4), abs(24 - hour + 4)) / 4  # Wide in Asia
+
+    def _compute_session_phase(self, m5_idx: int) -> float:
+        """
+        V3.7: Session phase encoding.
+        0.0 = Asia (low vol), 0.5 = London, 1.0 = NY, 0.25 = overlap.
+        """
+        bar_in_day = m5_idx % 288
+        hour = (bar_in_day * 5) / 60
+        if 0 <= hour < 8:
+            return 0.0   # Asia
+        elif 8 <= hour < 13:
+            return 0.5   # London
+        elif 13 <= hour < 17:
+            return 0.75  # London/NY overlap (best liquidity)
+        elif 17 <= hour < 21:
+            return 1.0   # NY solo
+        else:
+            return 0.1   # Off-hours
+
+    def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int, m5_idx: int = 0) -> np.ndarray:
+        """V3.7: Append OB proximity + Volume spike + Spread + Session to a bar (50→54)."""
         ob_prox = self._compute_ob_proximity(data, bar_idx)
         vol_spike = self._compute_volume_spike(data, bar_idx)
-        return np.append(bar, [ob_prox, vol_spike]).astype(np.float32)
+        spread = self._compute_synthetic_spread(m5_idx)
+        session = self._compute_session_phase(m5_idx)
+        return np.append(bar, [ob_prox, vol_spike, spread, session]).astype(np.float32)
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.6.1: Flat 416-dim observation.
-        = 1 H1 bar (52) + 1 M15 bar (52) + 1 M5 bar (52) + 5 M1 bars (260)
+        V3.7: Flat 432-dim observation.
+        = 1 H1 bar (54) + 1 M15 bar (54) + 1 M5 bar (54) + 5 M1 bars (270)
 
         H1: macro trend | M15: structure context | M5: entry zone | M1: sniper precision
-        +2 per bar: OB proximity + Volume spike (SMC awareness)
+        +4 per bar: OB proximity + Volume spike + Spread + Session phase
         All features normalized by ATR.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # H1: current bar (50+2=52-dim) — macro trend (BOS/CHoCH)
+        # H1: current bar (50+4=54-dim) — macro trend (BOS/CHoCH)
         h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
         h1_bar = self.data_h1[h1_idx].copy()
         h1_bar[:10] = h1_bar[:10] / atr
-        h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx)
+        h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx, m5_idx)
 
-        # M15: current bar (50+2=52-dim) — structure context (OB/FVG)
+        # M15: current bar (50+4=54-dim) — structure context (OB/FVG)
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_bar = self.data_m15[m15_idx].copy()
         m15_bar[:10] = m15_bar[:10] / atr
-        m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx)
+        m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx, m5_idx)
 
-        # M5: current bar (50+2=52-dim) — entry zone
+        # M5: current bar (50+4=54-dim) — entry zone
         m5_bar = self.data_m5[m5_idx].copy()
         m5_bar[:10] = m5_bar[:10] / atr
-        m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx)
+        m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx, m5_idx)
 
-        # M1: last 5 bars (5×52=260-dim) — sniper precision
+        # M1: last 5 bars (5×54=270-dim) — sniper precision
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
         m1_enriched = []
         for i in range(m1_start_idx, m1_end_idx + 1):
             bar = self.data_m1[i].copy()
             bar[:10] = bar[:10] / atr
-            bar = self._enrich_bar(bar, self.data_m1, i)
+            bar = self._enrich_bar(bar, self.data_m1, i, m5_idx)
             m1_enriched.append(bar)
 
         # Zero-pad if fewer than 5 M1 bars
         while len(m1_enriched) < 5:
-            m1_enriched.insert(0, np.zeros(52, dtype=np.float32))
+            m1_enriched.insert(0, np.zeros(54, dtype=np.float32))
 
         m1_flat = np.concatenate(m1_enriched)
 
-        # Flatten: H1 (52) + M15 (52) + M5 (52) + M1 (260) = 416
+        # Flatten: H1 (54) + M15 (54) + M5 (54) + M1 (270) = 432
         obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_flat]).astype(np.float32)
 
         # Clip to prevent extreme values
