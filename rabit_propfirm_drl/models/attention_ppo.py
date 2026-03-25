@@ -37,6 +37,8 @@ class AttentionPPO(nn.Module):
         dropout: float = 0.1,
         contrastive_dim: int = 128,
         confidence_threshold: float = 0.70,
+        confidence_mode: str = "relative",   # "hard" = old 70%, "relative" = P(act) > 2×P(HOLD)
+        confidence_ratio: float = 2.0,       # For relative mode: P(act) must be > ratio × P(HOLD)
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -45,6 +47,8 @@ class AttentionPPO(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.confidence_threshold = confidence_threshold
+        self.confidence_mode = confidence_mode
+        self.confidence_ratio = confidence_ratio
 
         # --- Token Embedding ---
         self.token_proj = nn.Linear(token_dim, d_model)
@@ -168,12 +172,21 @@ class AttentionPPO(nn.Module):
             action = dist.sample()
             # --- M1 Confidence Gate (INFERENCE ONLY) ---
             # During training: explore freely (no gate)
-            # During eval/backtest: only BUY/SELL when confidence > threshold
+            # During eval/backtest: filter low-confidence BUY/SELL
             if not self.training:
                 probs = torch.softmax(logits, dim=-1)
-                max_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
                 is_entry = (action == 0) | (action == 1)  # BUY or SELL
-                low_confidence = max_prob < self.confidence_threshold
+
+                if self.confidence_mode == "relative":
+                    # Relative Gate: P(BUY/SELL) must be > ratio × P(HOLD)
+                    action_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
+                    hold_prob = probs[:, 2]  # P(HOLD)
+                    low_confidence = action_prob < (self.confidence_ratio * hold_prob)
+                else:
+                    # Hard Gate: P(BUY/SELL) must be > fixed threshold
+                    max_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
+                    low_confidence = max_prob < self.confidence_threshold
+
                 gate_mask = is_entry & low_confidence
                 action = torch.where(gate_mask, torch.tensor(2, device=obs.device), action)  # Override to HOLD
         log_prob = dist.log_prob(action)

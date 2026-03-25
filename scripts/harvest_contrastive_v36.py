@@ -43,10 +43,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(MODELS / "best_v36_stage1.pt", map_location=device, weights_only=False)
-    model = AttentionPPO(obs_dim=400, n_actions=4).to(device)
+    obs_dim = ckpt.get("obs_dim", 416)
+    model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    logger.info("Loaded V3.6 S1 (step=%d)", ckpt.get("step", 0))
+    # Disable confidence gate for harvest — we want ALL trades (even low-confidence)
+    model.confidence_threshold = 0.0
+    logger.info("Loaded V3.6 S1 (step=%d, obs_dim=%d, gate=OFF)", ckpt.get("step", 0), obs_dim)
 
     with open(PROJECT / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
         cfg = yaml.safe_load(f)
