@@ -160,47 +160,37 @@ def contrastive_loss(
     model,
     win_obs: torch.Tensor,
     loss_obs: torch.Tensor,
-    temperature: float = 0.07,
+    margin: float = 1.0,
 ) -> torch.Tensor:
     """
-    InfoNCE contrastive loss.
+    Margin-based contrastive loss.
     
-    Pushes WIN embeddings apart from LOSS embeddings in the learned space.
-    Win-win pairs should be close, win-loss pairs should be far.
+    WIN embeddings should cluster together (small pairwise distance),
+    LOSS embeddings should be far from WIN embeddings (distance > margin).
+    
+    Loss = mean_win_pairs(d²) + mean_cross_pairs(max(0, margin - d)²)
     
     Args:
         model: AttentionPPO with get_embedding() method
         win_obs: (B, 400) WIN observations
         loss_obs: (B, 400) LOSS observations  
-        temperature: scaling factor for cosine similarity
+        margin: minimum distance between WIN and LOSS clusters
         
     Returns:
-        scalar loss
+        scalar loss (bounded, numerically stable)
     """
     embed_win = model.get_embedding(win_obs)    # (B, 128) L2-norm
     embed_loss = model.get_embedding(loss_obs)  # (B, 128) L2-norm
 
-    B = embed_win.shape[0]
+    # 1. Pull WIN embeddings together (positive pairs)
+    #    Distance between consecutive win pairs
+    win_dist = torch.norm(embed_win[:-1] - embed_win[1:], dim=1)  # (B-1,)
+    pull_loss = (win_dist ** 2).mean()
 
-    # Similarity matrix: win_i vs loss_j
-    # Positive pair: (win_i, loss_i) should have different embeddings
-    # We want: win embeddings cluster together, loss embeddings apart from wins
-    
-    # Build similarity matrix of all pairs
-    all_embeds = torch.cat([embed_win, embed_loss], dim=0)  # (2B, 128)
-    sim = all_embeds @ all_embeds.T / temperature            # (2B, 2B)
+    # 2. Push WIN away from LOSS (negative pairs) 
+    #    Paired distance: win_i vs loss_i
+    cross_dist = torch.norm(embed_win - embed_loss, dim=1)  # (B,)
+    push_loss = (torch.clamp(margin - cross_dist, min=0) ** 2).mean()
 
-    # Labels: each win_i is positive with other wins, negative with losses
-    labels = torch.cat([
-        torch.zeros(B, dtype=torch.long),  # wins = class 0
-        torch.ones(B, dtype=torch.long),   # losses = class 1
-    ]).to(win_obs.device)
+    return pull_loss + push_loss
 
-    # Mask out self-similarity
-    mask = torch.eye(2 * B, dtype=torch.bool, device=win_obs.device)
-    sim.masked_fill_(mask, -1e9)
-
-    # InfoNCE: for each win, pull toward other wins, push away from losses
-    loss = torch.nn.functional.cross_entropy(sim[:B], labels[:B])
-
-    return loss
