@@ -166,14 +166,16 @@ class AttentionPPO(nn.Module):
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
-            # --- M1 Confidence Gate ---
-            # If confidence < threshold for BUY/SELL, override to HOLD
-            probs = torch.softmax(logits, dim=-1)
-            max_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
-            is_entry = (action == 0) | (action == 1)  # BUY or SELL
-            low_confidence = max_prob < self.confidence_threshold
-            gate_mask = is_entry & low_confidence
-            action = torch.where(gate_mask, torch.tensor(2, device=obs.device), action)  # Override to HOLD
+            # --- M1 Confidence Gate (INFERENCE ONLY) ---
+            # During training: explore freely (no gate)
+            # During eval/backtest: only BUY/SELL when confidence > threshold
+            if not self.training:
+                probs = torch.softmax(logits, dim=-1)
+                max_prob = probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
+                is_entry = (action == 0) | (action == 1)  # BUY or SELL
+                low_confidence = max_prob < self.confidence_threshold
+                gate_mask = is_entry & low_confidence
+                action = torch.where(gate_mask, torch.tensor(2, device=obs.device), action)  # Override to HOLD
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         return action, log_prob, entropy, value
