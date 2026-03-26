@@ -164,6 +164,11 @@ def train_stage1(
     logger.info("AsyncVectorEnv: %d envs, obs=%s", n_envs, obs_batch.shape)
 
     model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
+    # V4.2: Load memory prototypes if available
+    mem_proto = MODELS_DIR / "memory_prototypes_v42.pt"
+    if mem_proto.exists():
+        model.load_memory_prototypes(str(mem_proto))
+        logger.info("V4.2: Memory prototypes loaded for S1")
     model.token_dropout_enabled = True  # V3.7.1: Token Dropout ON for S1
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
@@ -275,6 +280,7 @@ def train_stage1(
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                model.freeze_core_memory_grads()  # V4.2: Protect frozen core prototypes
                 optimizer.step()
 
                 avg_pi += policy_loss.item()
@@ -390,6 +396,10 @@ def train_stage2(
     else:
         logger.warning("No S1 checkpoint found, starting from scratch!")
 
+    # V4.2: Load memory prototypes
+    mem_proto = MODELS_DIR / "memory_prototypes_v42.pt"
+    if mem_proto.exists():
+        model.load_memory_prototypes(str(mem_proto))
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     model.token_dropout_enabled = False  # V3.7.1: Token Dropout OFF for S2 (CL needs full context)
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
@@ -483,6 +493,7 @@ def train_stage2(
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                model.freeze_core_memory_grads()  # V4.2: Protect frozen core prototypes
                 optimizer.step()
 
                 avg_pi += policy_loss.item()
@@ -611,6 +622,10 @@ def train_stage3(
             model.load_state_dict(ckpt["model_state_dict"])
             logger.info("FALLBACK: loaded S1 (step=%d)", ckpt.get("step", 0))
 
+    # V4.2: Load memory prototypes
+    mem_proto = MODELS_DIR / "memory_prototypes_v42.pt"
+    if mem_proto.exists():
+        model.load_memory_prototypes(str(mem_proto))
     # Lower LR for fine-tuning
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
     model.token_dropout_enabled = True  # V3.7.1: Token Dropout ON for S3
@@ -702,6 +717,7 @@ def train_stage3(
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                model.freeze_core_memory_grads()  # V4.2: Protect frozen core prototypes
                 optimizer.step()
 
                 avg_pi += policy_loss.item()

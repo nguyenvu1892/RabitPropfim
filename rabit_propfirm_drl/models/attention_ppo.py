@@ -1,20 +1,23 @@
 """
-V3.8 AttentionPPO -- Cross-Attention (Micro=Q, Macro=K/V) with Fake Setup Mining.
+V4.2 AttentionPPO -- Dual Memory Banks (Song Mã Ký Ức).
 
 Architecture:
-    432-dim flat obs → 8 tokens × 54-dim
+    448-dim flat obs → 8 tokens × 56-dim → d_model=64
     
     Stage 1: Independent Feature Extraction
         Macro: H1 + M15 (2 tokens) → Self-Attention (1L, 4H) → macro_ctx
         Micro: M5 + M1×5 (6 tokens) → Self-Attention (1L, 4H) → micro_ctx
     
-    Stage 2: Gated Cross-Attention
-        Q = micro_ctx, K = V = macro_ctx
-        Micro tokens look up Macro context to validate their setups.
-        Output → Average pooled → Actor/Critic/Contrastive Head
+    Stage 2: Memory-Augmented Cross-Attention
+        Q = micro_ctx (6 tokens)
+        K = V = [macro_ctx (2) + win_memory (8) + loss_memory (8)] = 18 tokens
+        Micro tokens query against: Macro context + Win patterns + Loss patterns
+        
+    Output → Average pooled → Actor/Critic/Contrastive Head
 
-Tokens (54-dim = 50 raw + OB_proximity + Volume_spike + Spread + Session):
-    [H1] [M15] [M5] [M1_bar1] [M1_bar2] [M1_bar3] [M1_bar4] [M1_bar5]
+Memory Banks (16 × 64-dim):
+    Sổ Tay Vàng (Win):  [4 Frozen Core] + [4 Adaptive EMA]
+    Sổ Tay Đen (Loss):  [4 Frozen Core] + [4 Adaptive EMA]
 """
 from __future__ import annotations
 import math
@@ -29,7 +32,7 @@ MICRO_TOKENS = [2, 3, 4, 5, 6, 7]  # M5, M1_b1-b5
 
 class AttentionPPO(nn.Module):
     """
-    V3.8 Cross-Attention PPO.
+    V4.2 Cross-Attention PPO with Dual Memory Banks.
     """
 
     def __init__(
@@ -47,6 +50,7 @@ class AttentionPPO(nn.Module):
         confidence_mode: str = "relative",
         confidence_ratio: float = 2.0,
         token_dropout_rate: float = 0.15,
+        n_memory_per_bank: int = 8,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -59,6 +63,7 @@ class AttentionPPO(nn.Module):
         self.confidence_ratio = confidence_ratio
         self.token_dropout_rate = token_dropout_rate
         self.token_dropout_enabled = True
+        self.n_memory_per_bank = n_memory_per_bank
 
         # --- Shared Token Embedding ---
         self.token_proj = nn.Linear(token_dim, d_model)
@@ -78,7 +83,16 @@ class AttentionPPO(nn.Module):
         )
         self.micro_encoder = nn.TransformerEncoder(micro_layer, num_layers=1)
 
-        # --- Stage 2: Cross-Attention (Micro looks at Macro) ---
+        # --- V4.2: Dual Memory Banks ---
+        # Learnable memory tokens (initialized from K-Means prototypes)
+        self.win_memory = nn.Parameter(torch.randn(n_memory_per_bank, d_model) * 0.02)
+        self.loss_memory = nn.Parameter(torch.randn(n_memory_per_bank, d_model) * 0.02)
+        # Frozen masks (set after loading prototypes)
+        self.register_buffer("win_frozen_mask", torch.zeros(n_memory_per_bank, dtype=torch.bool))
+        self.register_buffer("loss_frozen_mask", torch.zeros(n_memory_per_bank, dtype=torch.bool))
+
+        # --- Stage 2: Memory-Augmented Cross-Attention ---
+        # Q = Micro (6 tokens), K/V = Macro (2) + Win Memory (8) + Loss Memory (8) = 18 tokens
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
         )
@@ -113,6 +127,25 @@ class AttentionPPO(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+    def load_memory_prototypes(self, proto_path: str):
+        """Load K-Means prototypes into memory banks."""
+        data = torch.load(proto_path, map_location=self.win_memory.device, weights_only=False)
+        with torch.no_grad():
+            self.win_memory.copy_(data["win_prototypes"][:self.n_memory_per_bank])
+            self.loss_memory.copy_(data["loss_prototypes"][:self.n_memory_per_bank])
+            self.win_frozen_mask.copy_(data["win_frozen_mask"][:self.n_memory_per_bank])
+            self.loss_frozen_mask.copy_(data["loss_frozen_mask"][:self.n_memory_per_bank])
+        print(f"V4.2: Loaded memory prototypes from {proto_path}")
+        print(f"  Win: {self.win_frozen_mask.sum()} frozen, {(~self.win_frozen_mask).sum()} adaptive")
+        print(f"  Loss: {self.loss_frozen_mask.sum()} frozen, {(~self.loss_frozen_mask).sum()} adaptive")
+
+    def freeze_core_memory_grads(self):
+        """Zero out gradients for frozen core prototypes after backward."""
+        if self.win_memory.grad is not None:
+            self.win_memory.grad[self.win_frozen_mask] = 0.0
+        if self.loss_memory.grad is not None:
+            self.loss_memory.grad[self.loss_frozen_mask] = 0.0
+
     def _tokenize(self, obs: torch.Tensor) -> torch.Tensor:
         B = obs.shape[0]
         return obs.view(B, self.n_tokens, self.token_dim)
@@ -146,8 +179,9 @@ class AttentionPPO(nn.Module):
 
     def _encode(self, obs: torch.Tensor):
         """
-        V3.8 Cross-Attention Encoding.
-        Returns: pooled (B, d_model), cross_attn_w (B, 1, 8, 8)
+        V4.2 Memory-Augmented Cross-Attention Encoding.
+        Q = Micro (6), K/V = [Macro (2) + Win Memory (8) + Loss Memory (8)] = 18
+        Returns: pooled (B, d_model), attn_compat (B, 1, 8, 8)
         """
         B = obs.shape[0]
         tokens = self._tokenize(obs)
@@ -162,39 +196,46 @@ class AttentionPPO(nn.Module):
         micro_x = x[:, MICRO_TOKENS, :] + self.micro_pos
         micro_ctx, micro_attn = self._encode_self_attn(micro_x, self.micro_encoder, self.micro_pos)
 
-        # 3. Cross-Attention: Micro (Q) queries Macro (K, V)
+        # 3. V4.2: Build Memory-Augmented K/V
+        # Memory tokens: (n_mem, d_model) → expand to (B, n_mem, d_model)
+        win_mem = self.win_memory.unsqueeze(0).expand(B, -1, -1)   # (B, 8, 64)
+        loss_mem = self.loss_memory.unsqueeze(0).expand(B, -1, -1) # (B, 8, 64)
+
+        # K/V = [Macro (2) + Win Memory (8) + Loss Memory (8)] = 18 tokens
+        kv_tokens = torch.cat([macro_ctx, win_mem, loss_mem], dim=1)  # (B, 18, 64)
+
+        # 4. Cross-Attention: Micro (Q) queries [Macro + Memory] (K, V)
         micro_ctx_norm = self.cross_norm(micro_ctx)
-        macro_ctx_norm = self.cross_norm(macro_ctx)
-        
-        # attn_w: (B, seq_Q, seq_K) -> (B, 6, 2)
+        kv_norm = self.cross_norm(kv_tokens)
+
+        # attn_w: (B, 6, 18)
         attn_out, cross_attn_w = self.cross_attn(
             query=micro_ctx_norm,
-            key=macro_ctx_norm,
-            value=macro_ctx_norm,
+            key=kv_norm,
+            value=kv_norm,
             need_weights=True,
             average_attn_weights=True,
         )
-        
+
         # Add & Norm, then FF
         micro_fused = micro_ctx + attn_out
         micro_fused = micro_fused + self.cross_ff(self.cross_ff_norm(micro_fused))
 
-        # Output is pooled micro tokens (since they now contain macro context)
+        # Output is pooled micro tokens
         pooled = micro_fused.mean(dim=1)  # (B, d_model)
 
-        # --- Fake 8x8 matrix for backward compatibility with explain_trade.py ---
-        # The cross_attn_w gives us (B, 6, 2) -> How much each Micro token looks at each Macro token.
-        # We will pad this to (B, 8, 8) format so backtest_v36.py doesn't crash.
-        # We place cross_attn_w in the [2:8, 0:2] block.
+        # --- Backward-compatible 8x8 attention matrix ---
         attn_compat = torch.zeros(B, 8, 8, device=obs.device)
-        attn_compat[:, MICRO_TOKENS[0]:MICRO_TOKENS[-1]+1, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1] = cross_attn_w
-        
-        # Add self-attention for completeness in analysis
+        # Extract Macro attention (first 2 cols of cross_attn_w)
+        macro_attn_slice = cross_attn_w[:, :, :2]  # (B, 6, 2) - micro→macro
+        attn_compat[:, MICRO_TOKENS[0]:MICRO_TOKENS[-1]+1, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1] = macro_attn_slice
+        # Macro self-attention
         attn_compat[:, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1, MACRO_TOKENS[0]:MACRO_TOKENS[-1]+1] = macro_attn.mean(dim=1)
-        # Normalize rows to 1 for display
         attn_compat = attn_compat / (attn_compat.sum(dim=-1, keepdim=True) + 1e-8)
-        
         attn_compat = attn_compat.unsqueeze(1)  # (B, 1, 8, 8)
+
+        # Store full cross-attention for analysis (optional)
+        self._cross_attn_full = cross_attn_w  # (B, 6, 18)
 
         return pooled, attn_compat
 
@@ -242,3 +283,15 @@ class AttentionPPO(nn.Module):
     def get_attention_weights(self, obs: torch.Tensor) -> torch.Tensor:
         _, attn_weights = self._encode(obs)
         return attn_weights
+
+    def get_memory_attention(self) -> dict:
+        """Return memory attention breakdown for analysis."""
+        if self._cross_attn_full is None:
+            return {}
+        # cross_attn_full: (B, 6, 18) → cols: [0:2]=Macro, [2:10]=Win, [10:18]=Loss
+        w = self._cross_attn_full.mean(dim=0).mean(dim=0)  # (18,)
+        return {
+            "macro_attn": w[:2].sum().item(),
+            "win_memory_attn": w[2:2+self.n_memory_per_bank].sum().item(),
+            "loss_memory_attn": w[2+self.n_memory_per_bank:].sum().item(),
+        }
