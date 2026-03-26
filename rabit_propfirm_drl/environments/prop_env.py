@@ -1,12 +1,12 @@
 """
 PropFirm Trading Environment -- Custom Gymnasium environment for DRL training.
 
-V3.9 -- "Giao Thoa" Architecture:
+V4.0 -- "Nỗi Đau" Architecture:
     - Discrete action space: BUY=0, SELL=1, HOLD=2, CLOSE=3
     - 4-TF Frame Stacking: H1 (56) + M15 (56) + M5 (56) + M1×5 (280) = 448-dim
-    - +6 features per bar: OB proximity + Volume spike + Spread + Session + OB Touch Count + Choppiness
-    - Trailing SL: Move SL to breakeven when unrealized PnL >= 1R
-    - Auto SL from M5 Swing Points, NO fixed TP
+    - Targeted features: OB Touch → M5 only, Choppiness → M15 only
+    - Real trade cost: Commission + Spread deducted from balance at entry
+    - Trailing SL: Move SL to breakeven when PnL >= 1R
     - Fixed lot (0.01), action_mode: "discrete" or "continuous" (legacy)
 """
 
@@ -51,9 +51,9 @@ class MultiTFTradingEnv(gym.Env):
         - "discrete": Discrete(4) BUY/SELL/HOLD/CLOSE
         - "continuous": Box(5,) (legacy)
 
-    Observation (V3.9 discrete mode):
+    Observation (V4.0 discrete mode):
         Flat Box(448,) = 1 H1 bar (56) + 1 M15 bar (56) + 1 M5 bar (56) + 5 M1 bars (280)
-        +6 features per bar: OB prox + Vol spike + Spread + Session + OB Touch + Choppiness
+        +6 per bar: OB prox + Vol spike + Spread + Session + OB Touch (M5 only) + Chop (M15 only)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -425,8 +425,9 @@ class MultiTFTradingEnv(gym.Env):
                     tp_price = 0.0  # No fixed TP — bot uses CLOSE
 
                     commission = self.commission_per_lot * exec_result.fill_lots
+                    spread_entry_cost = exec_result.spread_pips * self.pip_value * exec_result.fill_lots * self.lot_value
                     self.balance -= commission
-
+                    self.balance -= spread_entry_cost  # V4.0: Real spread cost felt at entry
                     pos = Position(
                         ticket=self._next_ticket,
                         direction=direction,
@@ -847,53 +848,53 @@ class MultiTFTradingEnv(gym.Env):
         chop = np.clip(chop, 0.0, 100.0)
         return float(chop / 100.0)  # Normalize to [0, 1]
 
-    def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int, m5_idx: int = 0) -> np.ndarray:
-        """V3.9: Append 6 features to a bar (50→56)."""
+    def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int, m5_idx: int = 0, token_type: str = "") -> np.ndarray:
+        """V4.0: Append 6 features to a bar (50→56). OB Touch only on M5, Choppiness only on M15."""
         ob_prox = self._compute_ob_proximity(data, bar_idx)
         vol_spike = self._compute_volume_spike(data, bar_idx)
         spread = self._compute_synthetic_spread(m5_idx)
         session = self._compute_session_phase(m5_idx)
-        ob_touch = self._compute_ob_touch_count(m5_idx)
-        choppiness = self._compute_m15_choppiness(m5_idx)
+        # V4.0: Targeted features — OB Touch only on M5, Choppiness only on M15
+        ob_touch = self._compute_ob_touch_count(m5_idx) if token_type == "M5" else 0.0
+        choppiness = self._compute_m15_choppiness(m5_idx) if token_type == "M15" else 0.0
         return np.append(bar, [ob_prox, vol_spike, spread, session, ob_touch, choppiness]).astype(np.float32)
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V3.9: Flat 448-dim observation.
+        V4.0: Flat 448-dim observation.
         = 1 H1 bar (56) + 1 M15 bar (56) + 1 M5 bar (56) + 5 M1 bars (280)
 
-        H1: macro trend | M15: structure context | M5: entry zone | M1: sniper precision
-        +6 per bar: OB proximity + Volume spike + Spread + Session + OB Touch + Choppiness
-        All features normalized by ATR.
+        H1: macro trend | M15: structure + Choppiness | M5: entry + OB Touch | M1: sniper
+        Targeted: OB Touch only on M5 token, Choppiness only on M15 token.
         """
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # H1: current bar (50+4=54-dim) — macro trend (BOS/CHoCH)
+        # H1: current bar (56-dim) — macro trend (BOS/CHoCH)
         h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
         h1_bar = self.data_h1[h1_idx].copy()
         h1_bar[:10] = h1_bar[:10] / atr
-        h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx, m5_idx)
+        h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx, m5_idx, token_type="H1")
 
-        # M15: current bar (50+4=54-dim) — structure context (OB/FVG)
+        # M15: current bar (56-dim) — structure context + CHOPPINESS
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_bar = self.data_m15[m15_idx].copy()
         m15_bar[:10] = m15_bar[:10] / atr
-        m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx, m5_idx)
+        m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx, m5_idx, token_type="M15")
 
-        # M5: current bar (50+4=54-dim) — entry zone
+        # M5: current bar (56-dim) — entry zone + OB TOUCH COUNT
         m5_bar = self.data_m5[m5_idx].copy()
         m5_bar[:10] = m5_bar[:10] / atr
-        m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx, m5_idx)
+        m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx, m5_idx, token_type="M5")
 
-        # M1: last 5 bars (5×54=270-dim) — sniper precision
+        # M1: last 5 bars (5×56=280-dim) — sniper precision (no targeted features)
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
         m1_enriched = []
         for i in range(m1_start_idx, m1_end_idx + 1):
             bar = self.data_m1[i].copy()
             bar[:10] = bar[:10] / atr
-            bar = self._enrich_bar(bar, self.data_m1, i, m5_idx)
+            bar = self._enrich_bar(bar, self.data_m1, i, m5_idx, token_type="M1")
             m1_enriched.append(bar)
 
         # Zero-pad if fewer than 5 M1 bars
