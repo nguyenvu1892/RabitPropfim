@@ -66,13 +66,14 @@ class ContrastiveMemory:
         self,
         batch_size: int = 64,
         device: torch.device = None,
+        target_obs_dim: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """
         Sample (win_obs, loss_obs) pairs from the same symbol.
         
         Returns:
-            win_obs: (B, 400) tensor of winning trade observations
-            loss_obs: (B, 400) tensor of losing trade observations
+            win_obs: (B, obs_dim) tensor of winning trade observations
+            loss_obs: (B, obs_dim) tensor of losing trade observations
         """
         if device is None:
             device = torch.device("cpu")
@@ -107,6 +108,12 @@ class ContrastiveMemory:
 
         win_obs = torch.from_numpy(np.array(win_obs_list)).float().to(device)
         loss_obs = torch.from_numpy(np.array(loss_obs_list)).float().to(device)
+        
+        # Zero-pad if target_obs_dim is larger (e.g. 464 → 488)
+        if target_obs_dim > 0 and win_obs.shape[-1] < target_obs_dim:
+            pad_size = target_obs_dim - win_obs.shape[-1]
+            win_obs = torch.nn.functional.pad(win_obs, (0, pad_size))
+            loss_obs = torch.nn.functional.pad(loss_obs, (0, pad_size))
 
         return win_obs, loss_obs
 

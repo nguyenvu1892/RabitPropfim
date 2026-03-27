@@ -323,7 +323,7 @@ def train_v45_stage3(
                 # Contrastive anchor
                 cl_loss_val = torch.tensor(0.0, device=device)
                 if memory is not None and memory.can_sample(min_per_symbol=3):
-                    pair = memory.sample_contrastive_pairs(cl_batch, device)
+                    pair = memory.sample_contrastive_pairs(cl_batch, device, target_obs_dim=obs_dim)
                     if pair is not None:
                         cl_loss_val = contrastive_loss(model, pair[0], pair[1])
 
