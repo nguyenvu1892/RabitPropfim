@@ -230,7 +230,7 @@ class ContrastiveMemory:
 
     @classmethod
     def load(cls, path: Path) -> ContrastiveMemory:
-        """Load Master Vault memory from disk."""
+        """Load Master Vault memory from disk (JSONL preferred, JSON legacy fallback)."""
         mem = cls()
         path = Path(path)
         if not path.exists():
@@ -239,6 +239,7 @@ class ContrastiveMemory:
         wins_path = path / "master_vault_wins.jsonl"
         losses_path = path / "master_vault_losses.jsonl"
         
+        # Try JSONL first (V4.5+ format)
         if wins_path.exists():
             with open(wins_path) as f:
                 for line in f:
@@ -258,6 +259,20 @@ class ContrastiveMemory:
                     if sym in mem.losses:
                         e["obs"] = np.array(e["obs"], dtype=np.float32)
                         mem.losses[sym].append(e)
+        
+        # Fallback: Legacy JSON format (V4.4 and earlier)
+        if mem.total_entries() == 0:
+            for sym in SYMBOLS:
+                for suffix, target in [("wins", mem.wins), ("losses", mem.losses)]:
+                    legacy = path / f"{sym}_{suffix}.json"
+                    if legacy.exists():
+                        with open(legacy) as f:
+                            entries = json.load(f)
+                        for e in entries:
+                            e["obs"] = np.array(e["obs"], dtype=np.float32)
+                            target[sym].append(e)
+            if mem.total_entries() > 0:
+                logger.info("Loaded %d entries from LEGACY JSON format", mem.total_entries())
                         
         logger.info("Master Vault loaded from %s (%d entries)", path, mem.total_entries())
         return mem
