@@ -29,10 +29,9 @@ class ContrastiveMemory:
     to teach the bot meaningful differences.
     """
 
-    def __init__(self, max_per_symbol: int = 500):
-        self.max_per_symbol = max_per_symbol
-        self.wins = {s: deque(maxlen=max_per_symbol) for s in SYMBOLS}
-        self.losses = {s: deque(maxlen=max_per_symbol) for s in SYMBOLS}
+    def __init__(self):
+        self.wins = {s: [] for s in SYMBOLS}
+        self.losses = {s: [] for s in SYMBOLS}
 
     def add_trade(
         self,
@@ -202,40 +201,65 @@ class ContrastiveMemory:
             len(self.wins[s]) + len(self.losses[s]) for s in SYMBOLS
         )
 
-    def save(self, path: Path):
-        """Save memory to disk."""
+    def save(self, path: Path, append: bool = True):
+        """Save Master Vault to disk in JSONL format."""
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        for sym in SYMBOLS:
-            safe = sym.replace(".", "_")
-            wins = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"], "confidence": e.get("confidence", 0)} for e in self.wins[sym]]
-            losses = [{"obs": e["obs"].tolist(), "action": e["action"], "pnl": e["pnl"], "regime": e["regime"], "confidence": e.get("confidence", 0)} for e in self.losses[sym]]
-            with open(path / f"{safe}_wins.json", "w") as f:
-                json.dump(wins, f)
-            with open(path / f"{safe}_losses.json", "w") as f:
-                json.dump(losses, f)
-        logger.info("ContrastiveMemory saved to %s (%d entries)", path, self.total_entries())
+        mode = "a" if append else "w"
+        
+        wins_file = path / "master_vault_wins.jsonl"
+        losses_file = path / "master_vault_losses.jsonl"
+        
+        with open(wins_file, mode) as fw:
+            for sym in SYMBOLS:
+                for e in self.wins[sym]:
+                    e_copy = dict(e)
+                    e_copy["symbol"] = sym
+                    e_copy["obs"] = e["obs"].tolist()
+                    fw.write(json.dumps(e_copy) + "\n")
+                    
+        with open(losses_file, mode) as fl:
+            for sym in SYMBOLS:
+                for e in self.losses[sym]:
+                    e_copy = dict(e)
+                    e_copy["symbol"] = sym
+                    e_copy["obs"] = e["obs"].tolist()
+                    fl.write(json.dumps(e_copy) + "\n")
+                    
+        logger.info("Master Vault saved to %s (%d new entries, append=%s)", path, self.total_entries(), append)
 
     @classmethod
-    def load(cls, path: Path, max_per_symbol: int = 500) -> ContrastiveMemory:
-        """Load memory from disk."""
-        mem = cls(max_per_symbol=max_per_symbol)
+    def load(cls, path: Path) -> ContrastiveMemory:
+        """Load Master Vault memory from disk."""
+        mem = cls()
         path = Path(path)
         if not path.exists():
             return mem
-        for sym in SYMBOLS:
-            safe = sym.replace(".", "_")
-            wins_path = path / f"{safe}_wins.json"
-            losses_path = path / f"{safe}_losses.json"
-            if wins_path.exists():
-                with open(wins_path) as f:
-                    for e in json.load(f):
-                        mem.wins[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown"), "confidence": e.get("confidence", 0)})
-            if losses_path.exists():
-                with open(losses_path) as f:
-                    for e in json.load(f):
-                        mem.losses[sym].append({"obs": np.array(e["obs"], dtype=np.float32), "action": e["action"], "pnl": e["pnl"], "regime": e.get("regime", "unknown"), "confidence": e.get("confidence", 0)})
-        logger.info("ContrastiveMemory loaded from %s (%d entries)", path, mem.total_entries())
+            
+        wins_path = path / "master_vault_wins.jsonl"
+        losses_path = path / "master_vault_losses.jsonl"
+        
+        if wins_path.exists():
+            with open(wins_path) as f:
+                for line in f:
+                    if not line.strip(): continue
+                    e = json.loads(line)
+                    sym = e.get("symbol")
+                    if sym in mem.wins:
+                        e["obs"] = np.array(e["obs"], dtype=np.float32)
+                        mem.wins[sym].append(e)
+                        
+        if losses_path.exists():
+            with open(losses_path) as f:
+                for line in f:
+                    if not line.strip(): continue
+                    e = json.loads(line)
+                    sym = e.get("symbol")
+                    if sym in mem.losses:
+                        e["obs"] = np.array(e["obs"], dtype=np.float32)
+                        mem.losses[sym].append(e)
+                        
+        logger.info("Master Vault loaded from %s (%d entries)", path, mem.total_entries())
         return mem
 
 

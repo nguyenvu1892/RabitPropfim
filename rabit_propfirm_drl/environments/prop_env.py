@@ -39,6 +39,7 @@ class Position:
     tp_price: float           # Take profit price
     entry_step: int           # Step when opened
     spread_cost: float = 0.0  # Cost paid at entry
+    original_sl_price: float = 0.0  # V4.4: Original SL before trailing
 
 
 # --- Multi-TF Trading Environment ---
@@ -80,6 +81,7 @@ class MultiTFTradingEnv(gym.Env):
         close_idx: int = 4,
         render_mode: str | None = None,
         ohlcv_m5: np.ndarray | None = None,
+        futures_m5: np.ndarray | None = None,
         action_mode: str = "discrete",  # V3.3: "discrete" or "continuous"
     ) -> None:
         super().__init__()
@@ -94,6 +96,11 @@ class MultiTFTradingEnv(gym.Env):
         self.close_idx = close_idx
         self.render_mode = render_mode
         self.action_mode = action_mode
+
+        # V4.3 Group B A/B Testing
+        self.use_crypto_futures = futures_m5 is not None
+        if self.use_crypto_futures:
+            self.futures_m5 = futures_m5.astype(np.float32)
 
         # --- V3: Real OHLCV for price calculations ---
         if ohlcv_m5 is not None:
@@ -125,6 +132,9 @@ class MultiTFTradingEnv(gym.Env):
 
         # --- V3.3: Precompute rolling ATR for normalization ---
         self.atr_array = self._precompute_atr(period=14)
+
+        # --- V4.3: Precompute macro features ---
+        self._precompute_macro_features()
 
         # --- Config ---
         self.config = config
@@ -161,10 +171,11 @@ class MultiTFTradingEnv(gym.Env):
         if self.action_mode == "discrete":
             # V3.9: BUY=0, SELL=1, HOLD=2, CLOSE=3
             self.action_space = spaces.Discrete(4)
-            # Flat obs: 1 H1 (56) + 1 M15 (56) + 1 M5 (56) + 5 M1 (280) = 448-dim
+            # V4.3: Flat obs: 8 tokens * 58-dim = 464-dim (or 61-dim = 488-dim)
+            obs_dim = 488 if getattr(self, "use_crypto_futures", False) else 464
             self.observation_space = spaces.Box(
                 low=-10.0, high=10.0,
-                shape=(448,),
+                shape=(obs_dim,),
                 dtype=np.float32,
             )
         else:
@@ -209,6 +220,39 @@ class MultiTFTradingEnv(gym.Env):
         # Prevent division by zero
         atr = np.maximum(atr, 1e-8)
         return atr
+
+    def _precompute_macro_features(self) -> None:
+        """V4.3: Precompute ADR Exhaustion and Session Sweep."""
+        if not self._use_real_ohlcv:
+            self.adr_exhaustion = np.zeros(len(self.data_m5), dtype=np.float32)
+            self.session_sweep = np.zeros(len(self.data_m5), dtype=np.float32)
+            return
+
+        import pandas as pd
+        ohlcv = self.ohlcv_m5
+        highs = pd.Series(ohlcv[:, 1])
+        lows = pd.Series(ohlcv[:, 2])
+        bars_per_day = 288
+
+        # Today's rolling high/low
+        today_highs = highs.rolling(window=bars_per_day, min_periods=1).max().values
+        today_lows = lows.rolling(window=bars_per_day, min_periods=1).min().values
+        
+        # ADR 20 days
+        dr_rolling = today_highs - today_lows
+        adr_20 = pd.Series(dr_rolling).rolling(window=bars_per_day * 20, min_periods=1).mean().values
+        adr_20 = np.maximum(adr_20, 1e-8)
+        
+        self.adr_exhaustion = np.clip((today_highs - today_lows) / adr_20, 0.0, 5.0).astype(np.float32)
+
+        # Session Sweep
+        prev_day_highs = highs.shift(bars_per_day).rolling(window=bars_per_day, min_periods=1).max().values
+        prev_day_lows = lows.shift(bars_per_day).rolling(window=bars_per_day, min_periods=1).min().values
+        
+        prev_day_highs = np.nan_to_num(prev_day_highs, nan=1e8)
+        prev_day_lows = np.nan_to_num(prev_day_lows, nan=-1e8)
+        
+        self.session_sweep = ((today_highs >= prev_day_highs) | (today_lows <= prev_day_lows)).astype(np.float32)
 
     def _reset_state(self) -> None:
         """Initialize or reset all episode state."""
@@ -273,6 +317,24 @@ class MultiTFTradingEnv(gym.Env):
             return self._step_discrete(int(action), price, hour_utc)
         else:
             return self._step_continuous(action, price, hour_utc)
+
+    def _calc_rr(self, pos: Position, pnl: float, exit_price: float = 0.0) -> float:
+        """V4.4 ATR-Normalized Reward:Risk ratio.
+        
+        R:R = |exit - entry| / |entry - original_SL|
+        Pure price-distance ratio — cross-asset compatible.
+        Positive when profitable, negative when losing.
+        """
+        original_sl = pos.original_sl_price if pos.original_sl_price != 0.0 else pos.sl_price
+        risk_distance = abs(pos.entry_price - original_sl)
+        if risk_distance <= 1e-8:
+            return 0.0
+        if exit_price == 0.0:
+            # Fallback: estimate exit from PnL direction
+            return 0.0
+        reward_distance = abs(exit_price - pos.entry_price)
+        rr = reward_distance / risk_distance
+        return float(rr if pnl > 0 else -rr)
 
     def _find_swing_sl(self, direction: int, m5_idx: int, entry_price: float) -> float:
         """
@@ -360,6 +422,7 @@ class MultiTFTradingEnv(gym.Env):
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
                     "close_reason": "SL_HIT" if pnl < 0 else "TRAILING_BE",
+                    "reward_risk_ratio": self._calc_rr(pos, pnl, exit_price=price),
                 })
 
         # --- Session close ---
@@ -375,6 +438,7 @@ class MultiTFTradingEnv(gym.Env):
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
                     "close_reason": "SESSION_END",
+                    "reward_risk_ratio": self._calc_rr(pos, pnl, exit_price=price),
                 })
             self.positions.clear()
 
@@ -393,6 +457,7 @@ class MultiTFTradingEnv(gym.Env):
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
                     "close_reason": "MANUAL_CLOSE",
+                    "reward_risk_ratio": self._calc_rr(pos, pnl, exit_price=price),
                 })
             self.positions.clear()
 
@@ -437,6 +502,7 @@ class MultiTFTradingEnv(gym.Env):
                         tp_price=tp_price,
                         entry_step=self.current_m5_step,
                         spread_cost=exec_result.spread_pips * self.pip_value * exec_result.fill_lots * self.lot_value,
+                        original_sl_price=sl_price,
                     )
                     self._next_ticket += 1
                     self.positions.append(pos)
@@ -531,6 +597,7 @@ class MultiTFTradingEnv(gym.Env):
                     "entry": pos.entry_price, "exit": price,
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
+                    "reward_risk_ratio": self._calc_rr(pos, pnl),
                 })
 
         # --- Session close ---
@@ -546,6 +613,7 @@ class MultiTFTradingEnv(gym.Env):
                     "pnl": pnl, "lots": pos.lots,
                     "duration": self.current_m5_step - pos.entry_step,
                     "close_reason": "SESSION_END",
+                    "reward_risk_ratio": self._calc_rr(pos, pnl),
                 })
             self.positions.clear()
 
@@ -595,6 +663,7 @@ class MultiTFTradingEnv(gym.Env):
                         sl_price=sl_price, tp_price=tp_price,
                         entry_step=self.current_m5_step,
                         spread_cost=exec_result.spread_pips * self.pip_value * exec_result.fill_lots * self.lot_value,
+                        original_sl_price=sl_price,
                     )
                     self._next_ticket += 1
                     self.positions.append(pos)
@@ -849,20 +918,34 @@ class MultiTFTradingEnv(gym.Env):
         return float(chop / 100.0)  # Normalize to [0, 1]
 
     def _enrich_bar(self, bar: np.ndarray, data: np.ndarray, bar_idx: int, m5_idx: int = 0, token_type: str = "") -> np.ndarray:
-        """V4.0: Append 6 features to a bar (50→56). OB Touch only on M5, Choppiness only on M15."""
+        """V4.3: Append 8 features to a bar (50→58). Added ADR Exhaustion and Session Sweep."""
         ob_prox = self._compute_ob_proximity(data, bar_idx)
         vol_spike = self._compute_volume_spike(data, bar_idx)
         spread = self._compute_synthetic_spread(m5_idx)
         session = self._compute_session_phase(m5_idx)
-        # V4.0: Targeted features — OB Touch only on M5, Choppiness only on M15
+        # Targeted features
         ob_touch = self._compute_ob_touch_count(m5_idx) if token_type == "M5" else 0.0
         choppiness = self._compute_m15_choppiness(m5_idx) if token_type == "M15" else 0.0
-        return np.append(bar, [ob_prox, vol_spike, spread, session, ob_touch, choppiness]).astype(np.float32)
+        
+        # V4.3 Macro features
+        adr_exh = self.adr_exhaustion[m5_idx]
+        swp = self.session_sweep[m5_idx]
+        
+        enriched = np.append(bar, [ob_prox, vol_spike, spread, session, ob_touch, choppiness, adr_exh, swp]).astype(np.float32)
+        
+        if getattr(self, "use_crypto_futures", False):
+            if m5_idx < len(self.futures_m5):
+                crypto_feat = self.futures_m5[m5_idx]
+            else:
+                crypto_feat = np.zeros(3, dtype=np.float32)
+            enriched = np.append(enriched, crypto_feat).astype(np.float32)
+            
+        return enriched
 
     def _get_obs_discrete(self) -> np.ndarray:
         """
-        V4.0: Flat 448-dim observation.
-        = 1 H1 bar (56) + 1 M15 bar (56) + 1 M5 bar (56) + 5 M1 bars (280)
+        V4.3: Flat 464-dim observation.
+        = 8 tokens * 58-dim
 
         H1: macro trend | M15: structure + Choppiness | M5: entry + OB Touch | M1: sniper
         Targeted: OB Touch only on M5 token, Choppiness only on M15 token.
@@ -870,24 +953,24 @@ class MultiTFTradingEnv(gym.Env):
         m5_idx = min(self.current_m5_step, self.n_m5_bars - 1)
         atr = self.atr_array[m5_idx]
 
-        # H1: current bar (56-dim) — macro trend (BOS/CHoCH)
+        # H1: current bar (58-dim) — macro trend (BOS/CHoCH)
         h1_idx = min(m5_idx // (self.m5_per_m15 * self.m15_per_h1), len(self.data_h1) - 1)
         h1_bar = self.data_h1[h1_idx].copy()
         h1_bar[:10] = h1_bar[:10] / atr
         h1_bar = self._enrich_bar(h1_bar, self.data_h1, h1_idx, m5_idx, token_type="H1")
 
-        # M15: current bar (56-dim) — structure context + CHOPPINESS
+        # M15: current bar (58-dim) — structure context + CHOPPINESS
         m15_idx = min(m5_idx // self.m5_per_m15, len(self.data_m15) - 1)
         m15_bar = self.data_m15[m15_idx].copy()
         m15_bar[:10] = m15_bar[:10] / atr
         m15_bar = self._enrich_bar(m15_bar, self.data_m15, m15_idx, m5_idx, token_type="M15")
 
-        # M5: current bar (56-dim) — entry zone + OB TOUCH COUNT
+        # M5: current bar (58-dim) — entry zone + OB TOUCH COUNT
         m5_bar = self.data_m5[m5_idx].copy()
         m5_bar[:10] = m5_bar[:10] / atr
         m5_bar = self._enrich_bar(m5_bar, self.data_m5, m5_idx, m5_idx, token_type="M5")
 
-        # M1: last 5 bars (5×56=280-dim) — sniper precision (no targeted features)
+        # M1: last 5 bars (5×58=290-dim) — sniper precision (no targeted features)
         m1_end_idx = min(m5_idx * self.m1_per_m5 + self.m1_per_m5 - 1, len(self.data_m1) - 1)
         m1_start_idx = max(0, m1_end_idx - 4)  # 5 bars
         m1_enriched = []
@@ -899,11 +982,11 @@ class MultiTFTradingEnv(gym.Env):
 
         # Zero-pad if fewer than 5 M1 bars
         while len(m1_enriched) < 5:
-            m1_enriched.insert(0, np.zeros(56, dtype=np.float32))
+            m1_enriched.insert(0, np.zeros(58, dtype=np.float32))
 
         m1_flat = np.concatenate(m1_enriched)
 
-        # Flatten: H1 (56) + M15 (56) + M5 (56) + M1 (280) = 448
+        # Flatten: 8 tokens * 58-dim = 464
         obs = np.concatenate([h1_bar, m15_bar, m5_bar, m1_flat]).astype(np.float32)
 
         # Clip to prevent extreme values

@@ -46,28 +46,37 @@ class RolloutBuffer:
         self.dones = torch.zeros((n_steps, n_envs), dtype=torch.float32)
         self.advantages = torch.zeros((n_steps, n_envs), dtype=torch.float32)
         self.returns = torch.zeros((n_steps, n_envs), dtype=torch.float32)
+        self.rr_preds = torch.zeros((n_steps, n_envs), dtype=torch.float32)
+        self.undiscounted_returns = torch.zeros((n_steps, n_envs), dtype=torch.float32)
         self.ptr = 0
 
     def reset(self):
         self.ptr = 0
 
-    def add(self, obs, actions, rewards, log_probs, values, dones):
+    def add(self, obs, actions, rewards, log_probs, values, rr_preds, dones):
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = actions
         self.rewards[self.ptr] = rewards
         self.log_probs[self.ptr] = log_probs
         self.values[self.ptr] = values
+        self.rr_preds[self.ptr] = rr_preds
         self.dones[self.ptr] = dones
         self.ptr += 1
 
     def compute_gae(self, next_value, gamma=0.99, gae_lambda=0.95):
         last_gae = 0
+        last_ret = 0
         for t in reversed(range(self.ptr)):
             next_val = next_value if t == self.ptr - 1 else self.values[t + 1]
             next_non_terminal = 1.0 - self.dones[t]
             delta = self.rewards[t] + gamma * next_val * next_non_terminal - self.values[t]
             last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
             self.advantages[t] = last_gae
+            
+            # Auxiliary R:R target: undiscounted future PnL
+            last_ret = self.rewards[t] + last_ret * next_non_terminal
+            self.undiscounted_returns[t] = last_ret
+            
         self.returns[:self.ptr] = self.advantages[:self.ptr] + self.values[:self.ptr]
 
     def flatten(self):
@@ -78,10 +87,12 @@ class RolloutBuffer:
             "log_probs": self.log_probs[:self.ptr].reshape(n).to(self.device),
             "advantages": self.advantages[:self.ptr].reshape(n).to(self.device),
             "returns": self.returns[:self.ptr].reshape(n).to(self.device),
+            "rr_preds": self.rr_preds[:self.ptr].reshape(n).to(self.device),
+            "undiscounted_returns": self.undiscounted_returns[:self.ptr].reshape(n).to(self.device),
         }
 
 
-def load_data(symbols):
+def load_data(symbols, ab_group="A"):
     from data_engine.normalizer import RunningNormalizer
     with open(DATA_DIR / "normalizer_v3.json") as f:
         nd = json.load(f)
@@ -94,6 +105,12 @@ def load_data(symbols):
             sd[tf] = norms[tf].normalize(np.load(DATA_DIR / f"{safe}_{tf}_50dim.npy")).astype(np.float32)
             op = DATA_DIR / f"{safe}_{tf}_ohlcv.npy"
             sd[f"{tf}_ohlcv"] = np.load(op).astype(np.float32) if op.exists() else None
+        
+        if ab_group == "B":
+            ab_fp = DATA_DIR / f"{safe}_M5_futures.npy"
+            if ab_fp.exists():
+                sd["M5_futures"] = np.load(ab_fp).astype(np.float32)
+                
         all_data[sym] = sd
     return all_data
 
@@ -118,7 +135,7 @@ def train_stage1(
     total_steps=750_000, n_envs=12, n_steps=2048, batch_size=512,
     n_epochs=4, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_coef=0.2,
     ent_coef=0.05, vf_coef=0.5, cl_coef=0.05, cl_batch=64,
-    max_grad_norm=0.5, device=None, test_mode=False,
+    max_grad_norm=0.5, device=None, test_mode=False, ab_group="A"
 ):
     if test_mode:
         total_steps, n_envs, n_steps, batch_size = 200, 4, 32, 16
@@ -129,10 +146,14 @@ def train_stage1(
     logger.info("=" * 70)
     logger.info("  V3.6 STAGE 1 -- AttentionPPO + Contrastive Learning")
     logger.info("  Device: %s | Steps: %d | Envs: %d", device, total_steps, n_envs)
-    logger.info("  cl_coef=%.3f | ent_coef=%.2f | LR=%.1e", cl_coef, ent_coef, lr)
+    logger.info("  cl_coef=%.3f | ent_coef=%.2f | LR=%.1e | A/B Group=%s", cl_coef, ent_coef, lr, ab_group)
     logger.info("=" * 70)
+    
+    # Isolate Symbols for Crypto A/B testing
+    active_symbols = ["BTCUSD", "ETHUSD"] if ab_group == "B" else SYMBOLS
+    logger.info("  Active Symbols: %s", active_symbols)
 
-    all_data = load_data(SYMBOLS)
+    all_data = load_data(active_symbols, ab_group=ab_group)
 
     import yaml as _yaml
     with open(project_root / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
@@ -151,33 +172,41 @@ def train_stage1(
                 data_m1=sd["M1"], data_m5=sd["M5"], data_m15=sd["M15"],
                 data_h1=sd.get("H1", np.zeros((200, 50), dtype=np.float32)),
                 config=env_config, n_features=50, initial_balance=10_000.0,
-                episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), action_mode="discrete",
+                episode_length=5000, ohlcv_m5=sd.get("M5_ohlcv"),
+                futures_m5=sd.get("M5_futures"), action_mode="discrete",
             )
             env.reset(seed=seed)
             return env
         return _init
 
-    env_fns = [make_env(SYMBOLS[i % len(SYMBOLS)], seed=100 + i) for i in range(n_envs)]
+    env_fns = [make_env(active_symbols[i % len(active_symbols)], seed=100 + i) for i in range(n_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns)
     obs_batch, _ = vec_env.reset()
     obs_dim = obs_batch.shape[1]
     logger.info("AsyncVectorEnv: %d envs, obs=%s", n_envs, obs_batch.shape)
 
     model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
+    # V4.4: Warm-start from V4.2 (5-symbol master, 448-dim) 
+    v42_ckpt = MODELS_DIR / "best_v36_stage3.pt"
+    if v42_ckpt.exists():
+        v42_step = model.warm_start_from_v42(str(v42_ckpt), device=device)
+        logger.info("V4.4: Warm-started from V4.2 S3 (step=%d), freezing price layers", v42_step)
+        model.freeze_price_layers()
     # V4.2: Load memory prototypes if available
     mem_proto = MODELS_DIR / "memory_prototypes_v42.pt"
     if mem_proto.exists():
         model.load_memory_prototypes(str(mem_proto))
         logger.info("V4.2: Memory prototypes loaded for S1")
     model.token_dropout_enabled = True  # V3.7.1: Token Dropout ON for S1
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, eps=1e-5)
     buffer = RolloutBuffer(n_steps, n_envs, obs_dim, device)
     memory = ContrastiveMemory(max_per_symbol=500)
 
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info("AttentionPPO: %d params (obs=%d, tokens=8×50)", total_params, obs_dim)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("AttentionPPO: %d params (%d trainable, obs=%d)", total_params, trainable, obs_dim)
 
-    best_ckpt = MODELS_DIR / "best_v36_stage1.pt"
+    best_ckpt = MODELS_DIR / f"best_v43_stage1_{ab_group}.pt"
     global_step = 0; start_time = time.time()
     total_buys = total_sells = total_holds = total_closes = 0
     # Track which symbol each env corresponds to
@@ -193,7 +222,7 @@ def train_stage1(
             obs_t = torch.from_numpy(obs_batch).float()
             obs_t = torch.nan_to_num(obs_t, nan=0.0, posinf=10.0, neginf=-10.0)
             with torch.no_grad():
-                action, log_prob, _, value = model.get_action_and_value(obs_t.to(device))
+                action, log_prob, _, value, rr_pred = model.get_action_and_value(obs_t.to(device))
             actions_np = action.cpu().numpy()
             for a in actions_np:
                 if a == 0: total_buys += 1
@@ -205,7 +234,7 @@ def train_stage1(
             dones = np.logical_or(terms, truncs).astype(np.float32)
             buffer.add(obs_t, action.cpu(),
                        torch.from_numpy(rewards.astype(np.float32)),
-                       log_prob.cpu(), value.cpu(), torch.from_numpy(dones))
+                       log_prob.cpu(), value.cpu(), rr_pred.cpu(), torch.from_numpy(dones))
 
             # Harvest trades for contrastive memory
             for env_i in range(n_envs):
@@ -257,8 +286,9 @@ def train_stage1(
                 mb_old_lp = flat["log_probs"][mb_idx]
                 mb_adv = flat["advantages"][mb_idx]
                 mb_ret = flat["returns"][mb_idx]
+                mb_undiscounted_ret = flat["undiscounted_returns"][mb_idx]
 
-                _, new_lp, entropy, new_val = model.get_action_and_value(mb_obs, mb_act)
+                _, new_lp, entropy, new_val, new_rr_pred = model.get_action_and_value(mb_obs, mb_act)
                 ratio = (new_lp - mb_old_lp).exp()
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
@@ -340,7 +370,7 @@ def train_stage2(
     total_steps=500_000, n_envs=12, n_steps=2048, batch_size=512,
     n_epochs=4, lr=1e-4, gamma=0.99, gae_lambda=0.95, clip_coef=0.2,
     ent_coef=0.03, vf_coef=0.5, cl_coef=0.10, cl_batch=64,
-    max_grad_norm=0.5, device=None, test_mode=False,
+    max_grad_norm=0.5, device=None, test_mode=False, ab_group="A",
 ):
     """Stage 2: Warm-start from S1 + load ContrastiveMemory from disk."""
     if test_mode:
@@ -352,10 +382,12 @@ def train_stage2(
     logger.info("=" * 70)
     logger.info("  V3.6 STAGE 2 -- PPO + Contrastive Learning (warm-start)")
     logger.info("  Device: %s | Steps: %d | Envs: %d", device, total_steps, n_envs)
-    logger.info("  cl_coef=%.3f | ent_coef=%.2f | LR=%.1e", cl_coef, ent_coef, lr)
+    logger.info("  cl_coef=%.3f | ent_coef=%.2f | LR=%.1e | A/B Group=%s", cl_coef, ent_coef, lr, ab_group)
     logger.info("=" * 70)
 
-    all_data = load_data(SYMBOLS)
+    # Isolate Symbols for Crypto A/B testing
+    active_symbols = ["BTCUSD", "ETHUSD"] if ab_group == "B" else SYMBOLS
+    all_data = load_data(active_symbols, ab_group=ab_group)
 
     import yaml as _yaml
     with open(project_root / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
@@ -374,20 +406,21 @@ def train_stage2(
                 data_m1=sd["M1"], data_m5=sd["M5"], data_m15=sd["M15"],
                 data_h1=sd.get("H1", np.zeros((200, 50), dtype=np.float32)),
                 config=env_config, n_features=50, initial_balance=10_000.0,
-                episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), action_mode="discrete",
+                episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), 
+                futures_m5=sd.get("M5_futures"), action_mode="discrete",
             )
             env.reset(seed=seed)
             return env
         return _init
 
-    env_fns = [make_env(SYMBOLS[i % len(SYMBOLS)], seed=200 + i) for i in range(n_envs)]
+    env_fns = [make_env(active_symbols[i % len(active_symbols)], seed=200 + i) for i in range(n_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns)
     obs_batch, _ = vec_env.reset()
     obs_dim = obs_batch.shape[1]
     logger.info("AsyncVectorEnv: %d envs, obs=%s", n_envs, obs_batch.shape)
 
     # --- WARM START from Stage 1 ---
-    s1_ckpt = MODELS_DIR / "best_v36_stage1.pt"
+    s1_ckpt = MODELS_DIR / f"best_v43_stage1_{ab_group}.pt"
     model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
     if s1_ckpt.exists():
         ckpt = torch.load(s1_ckpt, map_location=device, weights_only=False)
@@ -407,7 +440,7 @@ def train_stage2(
     # --- LOAD Contrastive Memory from disk ---
     memory = ContrastiveMemory.load(MEMORY_DIR, max_per_symbol=500)
     logger.info("Contrastive Memory: %d entries loaded", memory.total_entries())
-    for sym in SYMBOLS:
+    for sym in active_symbols:
         s = memory.stats()[sym]
         logger.info("  %-12s | WIN=%4d | LOSS=%4d", sym, s["wins"], s["losses"])
 
@@ -419,7 +452,7 @@ def train_stage2(
     total_params = sum(p.numel() for p in model.parameters())
     logger.info("AttentionPPO: %d params", total_params)
 
-    best_ckpt = MODELS_DIR / "best_v36_stage2.pt"
+    best_ckpt = MODELS_DIR / f"best_v43_stage2_{ab_group}.pt"
     global_step = 0; start_time = time.time()
     total_buys = total_sells = total_holds = total_closes = 0
 
@@ -433,7 +466,7 @@ def train_stage2(
             obs_t = torch.from_numpy(obs_batch).float()
             obs_t = torch.nan_to_num(obs_t, nan=0.0, posinf=10.0, neginf=-10.0)
             with torch.no_grad():
-                action, log_prob, _, value = model.get_action_and_value(obs_t.to(device))
+                action, log_prob, _, value, rr_pred = model.get_action_and_value(obs_t.to(device))
             actions_np = action.cpu().numpy()
             for a in actions_np:
                 if a == 0: total_buys += 1
@@ -445,7 +478,7 @@ def train_stage2(
             dones = np.logical_or(terms, truncs).astype(np.float32)
             buffer.add(obs_t, action.cpu(),
                        torch.from_numpy(rewards.astype(np.float32)),
-                       log_prob.cpu(), value.cpu(), torch.from_numpy(dones))
+                       log_prob.cpu(), value.cpu(), rr_pred.cpu(), torch.from_numpy(dones))
             obs_batch = next_obs
             global_step += n_envs
 
@@ -473,8 +506,9 @@ def train_stage2(
                 mb_old_lp = flat["log_probs"][mb_idx]
                 mb_adv = flat["advantages"][mb_idx]
                 mb_ret = flat["returns"][mb_idx]
+                mb_undiscounted_ret = flat["undiscounted_returns"][mb_idx]
 
-                _, new_lp, entropy, new_val = model.get_action_and_value(mb_obs, mb_act)
+                _, new_lp, entropy, new_val, new_rr_pred = model.get_action_and_value(mb_obs, mb_act)
                 ratio = (new_lp - mb_old_lp).exp()
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
@@ -550,7 +584,7 @@ def train_stage3(
     total_steps=1_500_000, n_envs=12, n_steps=2048, batch_size=512,
     n_epochs=4, lr=3e-5, gamma=0.99, gae_lambda=0.95, clip_coef=0.2,
     ent_coef=0.005, vf_coef=0.5, cl_coef=0.01, cl_batch=64,
-    max_grad_norm=0.5, device=None, test_mode=False,
+    max_grad_norm=0.5, device=None, test_mode=False, ab_group="A",
 ):
     """Stage 3: Self-Improvement — PPO Fine-tuning from S2 checkpoint.
 
@@ -569,11 +603,13 @@ def train_stage3(
     logger.info("=" * 70)
     logger.info("  V3.6.1 STAGE 3 -- Self-Improvement (PPO Fine-tune from S2)")
     logger.info("  Device: %s | Steps: %d | Envs: %d", device, total_steps, n_envs)
-    logger.info("  cl_coef=%.3f | ent_coef=%.3f | LR=%.1e", cl_coef, ent_coef, lr)
+    logger.info("  cl_coef=%.3f | ent_coef=%.3f | LR=%.1e | A/B Group=%s", cl_coef, ent_coef, lr, ab_group)
     logger.info("  Confidence Gate: RELATIVE (P(act) > 2×P(HOLD))")
     logger.info("=" * 70)
 
-    all_data = load_data(SYMBOLS)
+    # Isolate Symbols for Crypto A/B testing
+    active_symbols = ["BTCUSD", "ETHUSD"] if ab_group == "B" else SYMBOLS
+    all_data = load_data(active_symbols, ab_group=ab_group)
 
     import yaml as _yaml
     with open(project_root / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
@@ -592,20 +628,21 @@ def train_stage3(
                 data_m1=sd["M1"], data_m5=sd["M5"], data_m15=sd["M15"],
                 data_h1=sd.get("H1", np.zeros((200, 50), dtype=np.float32)),
                 config=env_config, n_features=50, initial_balance=10_000.0,
-                episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), action_mode="discrete",
+                episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), 
+                futures_m5=sd.get("M5_futures"), action_mode="discrete",
             )
             env.reset(seed=seed)
             return env
         return _init
 
-    env_fns = [make_env(SYMBOLS[i % len(SYMBOLS)], seed=300 + i) for i in range(n_envs)]
+    env_fns = [make_env(active_symbols[i % len(active_symbols)], seed=300 + i) for i in range(n_envs)]
     vec_env = gymnasium.vector.AsyncVectorEnv(env_fns)
     obs_batch, _ = vec_env.reset()
     obs_dim = obs_batch.shape[1]
     logger.info("AsyncVectorEnv: %d envs, obs=%s", n_envs, obs_batch.shape)
 
     # --- WARM START from Stage 2 ---
-    s2_ckpt = MODELS_DIR / "best_v36_stage2.pt"
+    s2_ckpt = MODELS_DIR / f"best_v43_stage2_{ab_group}.pt"
     model = AttentionPPO(
         obs_dim=obs_dim, n_actions=4,
         confidence_mode="relative", confidence_ratio=2.0,
@@ -616,7 +653,7 @@ def train_stage3(
         logger.info("WARM START from S2 (step=%d)", ckpt.get("step", 0))
     else:
         logger.warning("No S2 checkpoint found! Falling back to S1...")
-        s1_ckpt = MODELS_DIR / "best_v36_stage1.pt"
+        s1_ckpt = MODELS_DIR / f"best_v43_stage1_{ab_group}.pt"
         if s1_ckpt.exists():
             ckpt = torch.load(s1_ckpt, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state_dict"])
@@ -639,7 +676,7 @@ def train_stage3(
     logger.info("AttentionPPO: %d params (confidence_mode=%s, ratio=%.1f)",
                 total_params, model.confidence_mode, model.confidence_ratio)
 
-    best_ckpt = MODELS_DIR / "best_v36_stage3.pt"
+    best_ckpt = MODELS_DIR / f"best_v43_stage3_{ab_group}.pt"
     global_step = 0; start_time = time.time()
     total_buys = total_sells = total_holds = total_closes = 0
 
@@ -654,7 +691,7 @@ def train_stage3(
             obs_t = torch.from_numpy(obs_batch).float()
             obs_t = torch.nan_to_num(obs_t, nan=0.0, posinf=10.0, neginf=-10.0)
             with torch.no_grad():
-                action, log_prob, _, value = model.get_action_and_value(obs_t.to(device))
+                action, log_prob, _, value, rr_pred = model.get_action_and_value(obs_t.to(device))
             actions_np = action.cpu().numpy()
             for a in actions_np:
                 if a == 0: total_buys += 1
@@ -666,7 +703,7 @@ def train_stage3(
             dones = np.logical_or(terms, truncs).astype(np.float32)
             buffer.add(obs_t, action.cpu(),
                        torch.from_numpy(rewards.astype(np.float32)),
-                       log_prob.cpu(), value.cpu(), torch.from_numpy(dones))
+                       log_prob.cpu(), value.cpu(), rr_pred.cpu(), torch.from_numpy(dones))
             obs_batch = next_obs
             global_step += n_envs
 
@@ -694,24 +731,29 @@ def train_stage3(
                 mb_old_lp = flat["log_probs"][mb_idx]
                 mb_adv = flat["advantages"][mb_idx]
                 mb_ret = flat["returns"][mb_idx]
+                mb_undiscounted_ret = flat["undiscounted_returns"][mb_idx]
 
-                _, new_lp, entropy, new_val = model.get_action_and_value(mb_obs, mb_act)
+                _, new_lp, entropy, new_val, new_rr_pred = model.get_action_and_value(mb_obs, mb_act)
                 ratio = (new_lp - mb_old_lp).exp()
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
                 policy_loss = torch.max(pg1, pg2).mean()
                 value_loss = F.mse_loss(new_val, mb_ret)
                 entropy_loss = entropy.mean()
+                
+                # V4.3: Auxiliary R:R Loss
+                rr_loss = F.mse_loss(new_rr_pred, mb_undiscounted_ret)
 
                 # Tiny contrastive anchor (prevent catastrophic forgetting)
                 cl_loss_val = torch.tensor(0.0, device=device)
-                if memory.can_sample(min_per_symbol=3):
+                if memory is not None and memory.can_sample(min_per_symbol=3):
                     pair = memory.sample_contrastive_pairs(cl_batch, device)
                     if pair is not None:
                         cl_loss_val = contrastive_loss(model, pair[0], pair[1])
 
                 loss = (policy_loss + vf_coef * value_loss
                         - ent_coef * entropy_loss
+                        + 0.5 * rr_loss  # V4.3: R:R head weight
                         + cl_coef * cl_loss_val)
 
                 optimizer.zero_grad()
@@ -782,6 +824,7 @@ def main():
     parser.add_argument("--ent-coef", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--ab-group", type=str, default="A", choices=["A", "B"], help="A=Base (dim=464), B=Futures (dim=488)")
     args = parser.parse_args()
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
     logger.info("Device: %s", device)
@@ -794,6 +837,7 @@ def main():
             n_envs=args.n_envs, device=device, test_mode=args.test,
             cl_coef=args.cl_coef if args.cl_coef is not None else 0.05,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.05,
+            ab_group=args.ab_group
         )
     elif args.stage == 2:
         train_stage2(
@@ -801,14 +845,16 @@ def main():
             n_envs=args.n_envs, device=device, test_mode=args.test,
             cl_coef=args.cl_coef if args.cl_coef is not None else 0.10,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.03,
+            ab_group=args.ab_group
         )
     elif args.stage == 3:
         train_stage3(
-            total_steps=args.total_steps or 1_500_000,
+            total_steps=args.total_steps or 5_000_000,  # 5M default for V4.3
             n_envs=args.n_envs, device=device, test_mode=args.test,
             cl_coef=args.cl_coef if args.cl_coef is not None else 0.01,
             ent_coef=args.ent_coef if args.ent_coef is not None else 0.005,
             lr=args.lr if args.lr is not None else 3e-5,
+            ab_group=args.ab_group
         )
     else:
         logger.error("V3.6 Stage %d not implemented", args.stage)

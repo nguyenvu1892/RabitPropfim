@@ -16,20 +16,35 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA = Path(__file__).resolve().parent.parent / "data"
 MODELS = Path(__file__).resolve().parent.parent / "models_saved"
 
-def load_model():
-    ckpt = torch.load(MODELS / "best_v36_stage1.pt", map_location=device, weights_only=False)
-    m = AttentionPPO(obs_dim=400, n_actions=4).to(device)
+def load_model(ab_group="A"):
+    # Try Stage 3 first, then Stage 2, then Stage 1
+    for stage in [3, 2, 1]:
+        ckpt_path = MODELS / f"best_v43_stage{stage}_{ab_group}.pt"
+        if ckpt_path.exists():
+            break
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    obs_dim = ckpt.get("obs_dim", 488 if ab_group == "B" else 464)
+    conf_mode = ckpt.get("confidence_mode", "relative" if stage == 3 else "threshold")
+    conf_ratio = ckpt.get("confidence_ratio", 2.0)
+    m = AttentionPPO(obs_dim=obs_dim, n_actions=4,
+                     confidence_mode=conf_mode, confidence_ratio=conf_ratio).to(device)
+    
+    # Load memory prototypes (V4.2 addition)
+    mem_proto = MODELS / "memory_prototypes_v42.pt"
+    if mem_proto.exists():
+        m.load_memory_prototypes(str(mem_proto))
+        
     m.load_state_dict(ckpt["model_state_dict"])
     m.eval()
-    print(f"V3.6 Stage 1 loaded (step={ckpt.get('step', 0)}, type={ckpt.get('model_type', 'unknown')})")
+    print(f"V4.3 Stage {stage} loaded (A/B: {ab_group}, step={ckpt.get('step',0)}, conf={conf_mode})")
     return m
 
-def run_backtest():
+def run_backtest(ab_group="A"):
     import yaml
     from data_engine.normalizer import RunningNormalizer
     from environments.prop_env import MultiTFTradingEnv
 
-    model = load_model()
+    model = load_model(ab_group)
     with open(Path(__file__).resolve().parent.parent / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
         cfg = yaml.safe_load(f)
     cfg["stage1_mode"] = True
@@ -37,7 +52,7 @@ def run_backtest():
         nd = json.load(f)
     norms = {k: RunningNormalizer.from_state_dict(v) for k, v in nd.items()}
 
-    syms = ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
+    syms = ["BTCUSD", "ETHUSD"] if ab_group == "B" else ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
     ta_t = ta_w = ta_mc = ta_mcw = ta_sl = 0
 
     # Attention collection
@@ -54,10 +69,16 @@ def run_backtest():
             op = DATA / f"{safe}_{tf}_ohlcv.npy"
             sd[f"{tf}_ohlcv"] = np.load(op).astype(np.float32) if op.exists() else None
 
+        futures_m5 = None
+        if ab_group == "B":
+            futures_op = DATA / f"{safe}_M5_futures.npy"
+            if futures_op.exists():
+                futures_m5 = np.load(futures_op).astype(np.float32)
+
         env = MultiTFTradingEnv(
             data_m1=sd["M1"], data_m5=sd["M5"], data_m15=sd["M15"], data_h1=sd["H1"],
-            config=cfg, n_features=50, initial_balance=10000, episode_length=2000,
-            ohlcv_m5=sd.get("M5_ohlcv"), action_mode="discrete",
+            config=cfg, n_features=50, initial_balance=10000, episode_length=5000,
+            ohlcv_m5=sd.get("M5_ohlcv"), futures_m5=futures_m5, action_mode="discrete",
         )
 
         B = S = H = C = 0
@@ -68,11 +89,11 @@ def run_backtest():
             obs, _ = env.reset(seed=42 + ep)
             prev_tickets = set()
 
-            for s in range(2000):
+            for s in range(5000):
                 ot = torch.from_numpy(obs).float().unsqueeze(0).to(device)
                 ot = torch.nan_to_num(ot, nan=0.0)
                 with torch.no_grad():
-                    logits, value, attn_w = model(ot)
+                    logits, value, attn_w, rr_pred = model(ot)
                     dist = torch.distributions.Categorical(logits=logits)
                     a_idx = int(dist.sample())
 
@@ -172,4 +193,8 @@ def run_backtest():
     print("\n" + "=" * 70)
 
 if __name__ == "__main__":
-    run_backtest()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ab-group", type=str, default="A", choices=["A", "B"])
+    args = parser.parse_args()
+    run_backtest(ab_group=args.ab_group)

@@ -4,6 +4,42 @@
 
 ---
 
+## 27/03/2026
+
+### [CHORE] Project Cleanup — Xóa Code Dùng Một Lần — 27/03
+- **Thực trạng:** Có một số script và sh file được tạo ra nhanh trong một số phase nhất định để test hoặc chạy quick backtest, nhưng hiện tại đã bị bỏ lại và có thể gây rác cho dự án.
+- **Xóa Scripts:** Xóa 6 file ad-hoc/old code trong thư mục scripts: `_debug_env.py`, `backtest_s2_quick.py`, `backtest_s3_quick.py`, `deep_stats_v38.py`, `harvest_memory_v42.py`, `v3_smoke_test.py`.
+- **Xóa Shell Runners:** Xóa các script liên quan đến V4.3 cũ (`run_v43_full_crypto.sh`, `run_v43_resume.sh`) để tập trung hoàn toàn vào pipeline V4.4 hiện tại.
+
+### [MAJOR] V4.5 — "Tích Lũy Tuyệt Đối" (Absolute Accumulation) — Master Vault Architecture — 27/03
+
+#### 1. Master Vault (Kho Lưu Trữ Bất Tử)
+- Sửa `contrastive_memory.py`: Xóa bỏ `maxlen`, chuyển sang JSONL Append-Only.
+- File gộp chung: `master_vault_wins.jsonl`, `master_vault_losses.jsonl`.
+- Bộ lọc: Wins R:R > 1.5, Losses Confidence ≥ 0.7.
+
+#### 2. Lò Luyện K-Means Dual Bank
+- Sửa `train_memory_prototypes.py`: Dùng `MiniBatchKMeans` clustering **riêng biệt** Win và Loss.
+- Output: `memory_prototypes_v45.pt` (`win_prototypes [8×64]`, `loss_prototypes [8×64]`, frozen masks).
+- Chiết xuất d_model=64 pooled representations qua `model._encode()` thay vì 128-dim embedding.
+
+#### 3. Stage 3 Training — Unified Battlefield
+- **[NEW]** `train_v45_stage3.py`: Train đồng thời TradFi (464-dim, zero-padded → 488) + Crypto (488-dim).
+- Warm-start từ best V4.4, **Freeze** toàn bộ Base Price Action layers.
+- Chỉ unfreeze: Cross-Attention, R:R Head, Actor, Critic, Contrastive, Memory Banks.
+- **[NEW]** `run_v45_stage3.sh`: Bash runner 6.5M steps.
+
+#### Files thay đổi:
+| File | Thay đổi |
+|------|----------|
+| `training_pipeline/contrastive_memory.py` | JSONL Append-Only, xóa maxlen |
+| `scripts/harvest_contrastive_v36.py` | Filter R:R > 1.5 + Confidence ≥ 0.7 |
+| `scripts/train_memory_prototypes.py` | [REWRITE] Dual bank [8×64] KMeans |
+| `scripts/train_v45_stage3.py` | [NEW] V4.5 Stage 3 Training (freeze + inject + zero-pad) |
+| `run_v45_stage3.sh` | [NEW] Bash runner 6.5M steps |
+
+---
+
 ## 25/03/2026
 
 ### [CHORE] Trọn gói Dọn dẹp Dự án (Project Cleanup) — 25/03 23:15

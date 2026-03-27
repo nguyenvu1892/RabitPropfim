@@ -20,6 +20,7 @@ DATA = PROJECT / "data"
 MODELS = PROJECT / "models_saved"
 MEMORY_DIR = MODELS / "contrastive_memory_v36"
 SYMBOLS = ["XAUUSD", "BTCUSD", "ETHUSD", "US30_cash", "US100_cash"]
+CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]
 
 def estimate_regime(data_m15, m5_idx, m5_per_m15=3):
     m15_idx = min(m5_idx // m5_per_m15, len(data_m15) - 1)
@@ -39,17 +40,26 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--max-per-sym", type=int, default=500)
+    parser.add_argument("--ab-group", type=str, default="A", choices=["A", "B"])
     args = parser.parse_args()
 
+    active_symbols = CRYPTO_SYMBOLS if args.ab_group == "B" else SYMBOLS
+    logger.info("A/B Group: %s | Symbols: %s", args.ab_group, active_symbols)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(MODELS / "best_v36_stage1.pt", map_location=device, weights_only=False)
-    obs_dim = ckpt.get("obs_dim", 416)
+    ckpt_path = MODELS / f"best_v43_stage1_{args.ab_group}.pt"
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    obs_dim = ckpt.get("obs_dim", 464)
     model = AttentionPPO(obs_dim=obs_dim, n_actions=4).to(device)
+    # Load memory prototypes if available
+    mem_proto = MODELS / "memory_prototypes_v42.pt"
+    if mem_proto.exists():
+        model.load_memory_prototypes(str(mem_proto))
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     # Disable confidence gate for harvest — we want ALL trades (even low-confidence)
     model.confidence_threshold = 0.0
-    logger.info("Loaded V3.6 S1 (step=%d, obs_dim=%d, gate=OFF)", ckpt.get("step", 0), obs_dim)
+    logger.info("Loaded S1 (%s, step=%d, obs_dim=%d, gate=OFF)", ckpt_path.name, ckpt.get("step", 0), obs_dim)
 
     with open(PROJECT / "rabit_propfirm_drl" / "configs" / "prop_rules.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -60,7 +70,7 @@ def main():
 
     memory = ContrastiveMemory(max_per_symbol=args.max_per_sym)
 
-    for sym in SYMBOLS:
+    for sym in active_symbols:
         safe = sym.replace(".", "_")
         sd = {}
         for tf in ["M1", "M5", "M15", "H1"]:
@@ -68,10 +78,18 @@ def main():
             op = DATA / f"{safe}_{tf}_ohlcv.npy"
             sd[f"{tf}_ohlcv"] = np.load(op).astype(np.float32) if op.exists() else None
 
+        # Load futures data for Group B
+        futures_m5 = None
+        if args.ab_group == "B":
+            fp = DATA / f"{safe}_M5_futures.npy"
+            if fp.exists():
+                futures_m5 = np.load(fp).astype(np.float32)
+
         env = MultiTFTradingEnv(
             data_m1=sd["M1"], data_m5=sd["M5"], data_m15=sd["M15"], data_h1=sd["H1"],
             config=cfg, n_features=50, initial_balance=10_000.0,
-            episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"), action_mode="discrete",
+            episode_length=2000, ohlcv_m5=sd.get("M5_ohlcv"),
+            futures_m5=futures_m5, action_mode="discrete",
         )
 
         total_trades = 0
@@ -89,7 +107,7 @@ def main():
                 obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
                 obs_t = torch.nan_to_num(obs_t, nan=0.0)
                 with torch.no_grad():
-                    logits, _, _ = model(obs_t)
+                    logits, _, _, _ = model(obs_t)
                     probs = torch.softmax(logits, dim=-1).squeeze(0)
                     dist = torch.distributions.Categorical(probs=probs)
                     action = int(dist.sample().item())
@@ -120,6 +138,14 @@ def main():
                         if ticket in pending:
                             ed = pending.pop(ticket)
                             pnl = trade.get("pnl", 0)
+                            rr = trade.get("reward_risk_ratio", 0)
+                            
+                            # V4.5 Master Vault Filter: Strict Quality Gates
+                            if pnl > 0 and rr <= 1.5:
+                                continue  # Only high R:R wins
+                            if pnl <= 0 and ed["confidence"] < 0.7:
+                                continue  # Only high confidence losses
+                            
                             memory.add_trade(
                                 obs=ed["obs"],
                                 action=ed["action"],
@@ -137,13 +163,13 @@ def main():
         logger.info("%-12s | %5d trades | WIN=%4d LOSS=%4d",
                      sym, total_trades, stats["wins"], stats["losses"])
 
-    memory.save(MEMORY_DIR)
+    memory.save(MEMORY_DIR, append=True)
 
     logger.info("=" * 70)
     logger.info("  CONTRASTIVE MEMORY HARVEST COMPLETE")
     total = memory.total_entries()
     logger.info("  Total: %d entries", total)
-    for sym in SYMBOLS:
+    for sym in active_symbols:
         s = memory.stats()[sym]
         logger.info("  %-12s | WIN=%4d | LOSS=%4d", sym, s["wins"], s["losses"])
     logger.info("  Saved to: %s", MEMORY_DIR)

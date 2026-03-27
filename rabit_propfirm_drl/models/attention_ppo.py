@@ -37,10 +37,9 @@ class AttentionPPO(nn.Module):
 
     def __init__(
         self,
-        obs_dim: int = 448,
+        obs_dim: int = 464,
         n_actions: int = 4,
         n_tokens: int = 8,
-        token_dim: int = 56,
         d_model: int = 64,
         n_heads: int = 4,
         d_ff: int = 256,
@@ -55,7 +54,7 @@ class AttentionPPO(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.n_tokens = n_tokens
-        self.token_dim = token_dim
+        self.token_dim = obs_dim // n_tokens
         self.d_model = d_model
         self.n_heads = n_heads
         self.confidence_threshold = confidence_threshold
@@ -66,7 +65,7 @@ class AttentionPPO(nn.Module):
         self.n_memory_per_bank = n_memory_per_bank
 
         # --- Shared Token Embedding ---
-        self.token_proj = nn.Linear(token_dim, d_model)
+        self.token_proj = nn.Linear(self.token_dim, d_model)
 
         # --- Stage 1: Self-Attention Encoders ---
         self.macro_pos = nn.Parameter(torch.randn(1, 2, d_model) * 0.02)
@@ -113,6 +112,10 @@ class AttentionPPO(nn.Module):
         self.critic_head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1),
         )
+        # V4.3: Auxiliary R:R Head
+        self.rr_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1),
+        )
         self.contrastive_head = nn.Sequential(
             nn.Linear(d_model, contrastive_dim),
         )
@@ -145,6 +148,61 @@ class AttentionPPO(nn.Module):
             self.win_memory.grad[self.win_frozen_mask] = 0.0
         if self.loss_memory.grad is not None:
             self.loss_memory.grad[self.loss_frozen_mask] = 0.0
+
+    def freeze_price_layers(self):
+        """V4.4: Freeze raw Price Action processing layers.
+        
+        Frozen: token_proj, macro_encoder, micro_encoder, macro_pos, micro_pos
+        Unfrozen: cross_attn, cross_norm, cross_ff, rr_head, actor_head, 
+                  critic_head, contrastive_head, win_memory, loss_memory
+        """
+        frozen_modules = [self.token_proj, self.macro_encoder, self.micro_encoder]
+        frozen_params = [self.macro_pos, self.micro_pos]
+        
+        for module in frozen_modules:
+            for param in module.parameters():
+                param.requires_grad = False
+        for param in frozen_params:
+            param.requires_grad = False
+        
+        n_frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"V4.4: Frozen {n_frozen:,} params | Trainable {n_trainable:,} params")
+
+    def warm_start_from_v42(self, ckpt_path: str, device="cpu"):
+        """V4.4: Load V4.2 checkpoint (448-dim) into 488-dim model.
+        
+        Handles token_dim mismatch (56 → 61) by copying compatible weights
+        into the first 56 columns of the new token_proj, leaving the last 5
+        (for Futures features) randomly initialized.
+        """
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        old_state = ckpt["model_state_dict"]
+        new_state = self.state_dict()
+        
+        loaded = 0
+        skipped = []
+        for key in old_state:
+            if key not in new_state:
+                skipped.append(key)
+                continue
+            if old_state[key].shape == new_state[key].shape:
+                new_state[key] = old_state[key]
+                loaded += 1
+            elif key == "token_proj.weight":
+                # V4.2: (64, 56), V4.4: (64, 61) — copy first 56 cols
+                old_w = old_state[key]  # (64, 56)
+                new_state[key][:, :old_w.shape[1]] = old_w
+                loaded += 1
+                print(f"  token_proj.weight: ({old_w.shape[1]}) → ({new_state[key].shape[1]}) [partial load]")
+            else:
+                skipped.append(f"{key} shape {old_state[key].shape}→{new_state[key].shape}")
+        
+        self.load_state_dict(new_state)
+        print(f"V4.4 Warm-start: {loaded} params loaded, {len(skipped)} skipped")
+        if skipped:
+            print(f"  Skipped: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+        return ckpt.get("step", 0)
 
     def _tokenize(self, obs: torch.Tensor) -> torch.Tensor:
         B = obs.shape[0]
@@ -243,8 +301,9 @@ class AttentionPPO(nn.Module):
         pooled, attn_weights = self._encode(obs)
         logits = self.actor_head(pooled)
         value = self.critic_head(pooled)
+        rr_pred = self.rr_head(pooled)
         self._attn_weights = attn_weights
-        return logits, value, attn_weights
+        return logits, value, rr_pred, attn_weights
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         pooled, _ = self._encode(obs)
@@ -254,6 +313,7 @@ class AttentionPPO(nn.Module):
         pooled, attn_weights = self._encode(obs)
         logits = self.actor_head(pooled)
         value = self.critic_head(pooled).squeeze(-1)
+        rr_pred = self.rr_head(pooled).squeeze(-1)
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
             action = dist.sample()
@@ -273,7 +333,7 @@ class AttentionPPO(nn.Module):
                 action = torch.where(gate_mask, torch.tensor(2, device=obs.device), action)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        return action, log_prob, entropy, value
+        return action, log_prob, entropy, value, rr_pred
 
     def get_embedding(self, obs: torch.Tensor) -> torch.Tensor:
         pooled, _ = self._encode(obs)
